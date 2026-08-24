@@ -224,6 +224,24 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
   })();
 });
 
+// ==========================================
+// CONFIGURACIÓN PARA SERVIR EL FRONTEND UNIFICADO
+// ==========================================
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Servir los archivos estáticos de la carpeta dist del frontend
+app.use(express.static(path.join(__dirname, '../frontend/dist')));
+
+// Cualquier ruta que no coincida con la API redirigirá al index.html de React
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
+});
+// ==========================================
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor escuchando en http://localhost:${PORT}`);
 });

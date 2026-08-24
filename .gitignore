@@ -9,8 +9,10 @@ backend/node_modules/
 frontend/.env
 backend/.env
 
+
 # Carpetas
 .vscode/
+frontend/dist
 
 
 frontend/package-lock.json
