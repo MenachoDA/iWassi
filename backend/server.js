@@ -6,6 +6,8 @@ import multer from 'multer';
 import dotenv from 'dotenv';
 import qrcode from 'qrcode';
 import pkg from 'whatsapp-web.js';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const { Client, LocalAuth, MessageMedia } = pkg;
 
@@ -29,18 +31,23 @@ app.use(express.json());
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// Variable global para mantener el estado del cliente de WhatsApp
-let client;
-let clientStatus = 'disconnected'; // 'disconnected' | 'authenticating' | 'ready' | 'qr'
-let lastQr = null;
+// Mapas para gestionar múltiples sesiones concurrentes
+const activeClients = new Map();
+const sessionStates = new Map(); // Guarda el estado: { status, lastQr }
 
-function initWhatsApp() {
-  console.log('Iniciando cliente de WhatsApp...');
-  clientStatus = 'authenticating';
-  io.emit('status', { status: clientStatus });
+// Función para inicializar o recuperar un cliente de WhatsApp por sesión
+function getOrInitClient(sessionId) {
+  if (activeClients.has(sessionId)) {
+    return activeClients.get(sessionId);
+  }
 
-  client = new Client({
+  console.log(`Iniciando cliente de WhatsApp para la sesión: ${sessionId}`);
+  sessionStates.set(sessionId, { status: 'authenticating', lastQr: null });
+  io.to(sessionId).emit('status', { status: 'authenticating' });
+
+  const client = new Client({
     authStrategy: new LocalAuth({
+      clientId: sessionId, // Separa los datos de autenticación por usuario
       dataPath: './.wwebjs_auth'
     }),
     puppeteer: {
@@ -50,66 +57,79 @@ function initWhatsApp() {
   });
 
   client.on('qr', (qr) => {
-    clientStatus = 'qr';
+    sessionStates.set(sessionId, { status: 'qr', lastQr: null });
     qrcode.toDataURL(qr, (err, url) => {
       if (!err) {
-        lastQr = url;
-        io.emit('qr', { qr: url });
-        io.emit('status', { status: 'qr' });
+        sessionStates.set(sessionId, { status: 'qr', lastQr: url });
+        io.to(sessionId).emit('qr', { qr: url });
+        io.to(sessionId).emit('status', { status: 'qr' });
       }
     });
   });
 
   client.on('ready', () => {
-    clientStatus = 'ready';
-    lastQr = null;
-    console.log('Cliente de WhatsApp listo.');
-    io.emit('status', { status: 'ready' });
+    sessionStates.set(sessionId, { status: 'ready', lastQr: null });
+    console.log(`Cliente de WhatsApp listo para sesión: ${sessionId}`);
+    io.to(sessionId).emit('status', { status: 'ready' });
   });
 
   client.on('authenticated', () => {
-    console.log('Cliente autenticado.');
+    console.log(`Cliente autenticado para sesión: ${sessionId}`);
   });
 
   client.on('auth_failure', (msg) => {
-    console.error('Fallo de autenticación:', msg);
-    clientStatus = 'disconnected';
-    io.emit('status', { status: 'disconnected', message: msg });
+    console.error(`Fallo de autenticación en sesión ${sessionId}:`, msg);
+    sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
+    io.to(sessionId).emit('status', { status: 'disconnected', message: msg });
   });
 
   client.on('disconnected', (reason) => {
-    console.log('Cliente desconectado:', reason);
-    clientStatus = 'disconnected';
-    io.emit('status', { status: 'disconnected', reason });
-    // Intenta reinicializar si se desconecta
+    console.log(`Cliente desconectado en sesión ${sessionId}:`, reason);
+    sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
+    io.to(sessionId).emit('status', { status: 'disconnected', reason });
+    
     try {
       client.destroy();
     } catch (e) {}
-    initWhatsApp();
+    
+    activeClients.delete(sessionId);
   });
 
   client.initialize().catch(err => {
-    console.error('Error al inicializar cliente:', err);
-    clientStatus = 'disconnected';
-    io.emit('status', { status: 'disconnected' });
+    console.error(`Error al inicializar sesión ${sessionId}:`, err);
+    sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
+    io.to(sessionId).emit('status', { status: 'disconnected' });
   });
+
+  activeClients.set(sessionId, client);
+  return client;
 }
 
-// Inicializar el cliente al arrancar el servidor
-initWhatsApp();
-
-// Manejo de conexiones de WebSocket
+// Manejo de conexiones de WebSocket por salas (rooms)
 io.on('connection', (socket) => {
   console.log('Cliente web conectado vía Socket.IO ID:', socket.id);
   
-  // Enviar estado actual al nuevo cliente
-  socket.emit('status', { status: clientStatus });
-  if (clientStatus === 'qr' && lastQr) {
-    socket.emit('qr', { qr: lastQr });
-  }
+  socket.on('join-session', ({ sessionId }) => {
+    if (!sessionId) return;
+    
+    socket.join(sessionId);
+    console.log(`Socket ${socket.id} unido a sala de sesión: ${sessionId}`);
+
+    // Inicializar el cliente correspondiente si no existe
+    getOrInitClient(sessionId);
+
+    // Enviar estado actual de esta sesión específica
+    const state = sessionStates.get(sessionId);
+    if (state) {
+      socket.emit('status', { status: state.status });
+      if (state.lastQr) {
+        socket.emit('qr', { qr: state.lastQr });
+      }
+    }
+  });
 });
 
-// Función auxiliar para formatear los números de teléfono
+// Función auxiliar para formatear los números de teléfono (Preservada intacta)
 function formatPhoneNumber(num) {
   let cleaned = num.replace(/\D/g, '');
 
@@ -119,7 +139,6 @@ function formatPhoneNumber(num) {
   else if (cleaned.length > 9 && !cleaned.startsWith('51')) {
     cleaned = `51${cleaned}`;
   }
-
 
   if (!cleaned.endsWith('@c.us')) {
     cleaned = `${cleaned}@c.us`;
@@ -132,13 +151,24 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Endpoint para reiniciar el cliente / cerrar sesión
 app.post('/api/logout', async (req, res) => {
+  const { sessionId } = req.body;
+  
+  if (!sessionId) {
+    return res.status(400).json({ success: false, error: 'Se requiere el identificador de sesión' });
+  }
+
   try {
+    const client = activeClients.get(sessionId);
     if (client) {
       await client.logout();
       await client.destroy();
+      activeClients.delete(sessionId);
     }
-    initWhatsApp();
-    res.json({ success: true, message: 'Sesión cerrada e inicializando nuevo código QR' });
+    
+    sessionStates.delete(sessionId);
+    getOrInitClient(sessionId);
+    
+    res.json({ success: true, message: `Sesión ${sessionId} cerrada e inicializando nuevo código QR` });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -146,12 +176,19 @@ app.post('/api/logout', async (req, res) => {
 
 // Endpoint para procesar el envío masivo
 app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
-  if (clientStatus !== 'ready') {
-    return res.status(400).json({ success: false, error: 'El servicio de WhatsApp no está listo' });
+  const { sessionId, numbers: rawNumbers, message, delaySeconds } = req.body;
+  const file = req.file;
+
+  if (!sessionId) {
+    return res.status(400).json({ success: false, error: 'Se requiere el identificador de sesión' });
   }
 
-  const { numbers: rawNumbers, message, delaySeconds } = req.body;
-  const file = req.file;
+  const client = activeClients.get(sessionId);
+  const state = sessionStates.get(sessionId);
+
+  if (!client || !state || state.status !== 'ready') {
+    return res.status(400).json({ success: false, error: 'El canal de WhatsApp seleccionado no está listo' });
+  }
 
   if (!rawNumbers || !message) {
     return res.status(400).json({ success: false, error: 'Números y mensaje son campos obligatorios' });
@@ -163,7 +200,7 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     .map(num => num.trim())
     .filter(num => num.length > 0);
 
-  const parsedDelay = Math.max(parseInt(delaySeconds, 10) || 5, 2) * 1000;
+  const parsedDelay = Math.max(parseInt(delaySeconds, 10) || 30, 2) * 1000;
 
   if (numbers.length === 0) {
     return res.status(400).json({ success: false, error: 'No se encontraron números válidos' });
@@ -172,7 +209,7 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
   // Responder inmediatamente que el proceso ha iniciado
   res.json({ success: true, message: 'Proceso de envío masivo iniciado', total: numbers.length });
 
-  // Ejecución en segundo plano para no bloquear la petición HTTP
+  // Ejecución en segundo plano independiente por sesión
   (async () => {
     let media = null;
     if (file) {
@@ -190,13 +227,13 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
 
       try {
         if (media) {
-          // Envía primero el archivo con el texto en el caption
           await client.sendMessage(formattedNum, media, { caption: message });
         } else {
           await client.sendMessage(formattedNum, message);
         }
 
-        io.emit('progress', {
+        // Emitir el progreso a la sala correspondiente a esta sesión
+        io.to(sessionId).emit('progress', {
           current: i + 1,
           total: numbers.length,
           number: rawNum,
@@ -205,8 +242,8 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
           error: null
         });
       } catch (error) {
-        console.error(`Error enviando a ${rawNum}:`, error);
-        io.emit('progress', {
+        console.error(`[Sesión ${sessionId}] Error enviando a ${rawNum}:`, error);
+        io.to(sessionId).emit('progress', {
           current: i + 1,
           total: numbers.length,
           number: rawNum,
@@ -216,7 +253,6 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
         });
       }
 
-      // Evitar aplicar retraso en el último mensaje enviado
       if (i < numbers.length - 1) {
         await delay(parsedDelay);
       }
@@ -227,9 +263,6 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
 // ==========================================
 // CONFIGURACIÓN PARA SERVIR EL FRONTEND UNIFICADO
 // ==========================================
-import path from 'path';
-import { fileURLToPath } from 'url';
-
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 

@@ -13,12 +13,21 @@ import {
   Info
 } from 'lucide-react';
 
-// Detección dinámica de la URL del backend en la red local
 const BACKEND_URL = window.location.origin;
 
+// Lista de sesiones predefinidas para los usuarios de su equipo
+const SESSIONS = [
+  { id: 'alvaro', name: 'Alvaro' },
+  { id: 'jefa', name: 'Jefa' },
+  { id: 'companero', name: 'Compañero' }
+];
+
 export default function App() {
-  // Estados de conexión
-  const [status, setStatus] = useState('disconnected'); // disconnected | authenticating | ready | qr
+  // Estado para la sesión activa seleccionada
+  const [selectedSession, setSelectedSession] = useState(SESSIONS[0].id);
+
+  // Estados de conexión vinculados a la sesión seleccionada
+  const [status, setStatus] = useState('disconnected');
   const [qrCode, setQrCode] = useState(null);
   const [socketConnected, setSocketConnected] = useState(false);
 
@@ -37,11 +46,24 @@ export default function App() {
   const socketRef = useRef(null);
 
   useEffect(() => {
+    // Restablecer estados visuales antes de conectarse a otra sesión
+    setStatus('authenticating');
+    setQrCode(null);
+    setProgress({ current: 0, total: 0 });
+    setLogs([]);
+    setIsSending(false);
+
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
+
     // Inicializar conexión Socket.IO
     socketRef.current = io(BACKEND_URL);
 
     socketRef.current.on('connect', () => {
       setSocketConnected(true);
+      // Unirse a la sala de la sesión actual
+      socketRef.current.emit('join-session', { sessionId: selectedSession });
     });
 
     socketRef.current.on('disconnect', () => {
@@ -72,7 +94,7 @@ export default function App() {
     return () => {
       if (socketRef.current) socketRef.current.disconnect();
     };
-  }, []);
+  }, [selectedSession]); // Se vuelve a ejecutar cuando cambia de usuario
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
@@ -85,9 +107,13 @@ export default function App() {
   };
 
   const handleLogout = async () => {
-    if (window.confirm('¿Seguro que deseas cerrar sesión en WhatsApp? Se perderá el enlace actual.')) {
+    if (window.confirm(`¿Seguro que deseas cerrar la sesión de "${selectedSession.toUpperCase()}"? Se perderá el enlace actual.`)) {
       try {
-        const response = await fetch(`${BACKEND_URL}/api/logout`, { method: 'POST' });
+        const response = await fetch(`${BACKEND_URL}/api/logout`, { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: selectedSession })
+        });
         const data = await response.json();
         if (data.success) {
           setQrCode(null);
@@ -106,6 +132,7 @@ export default function App() {
     setLogs([]);
 
     const formData = new FormData();
+    formData.append('sessionId', selectedSession); // Se envía la sesión activa
     formData.append('numbers', numbers);
     formData.append('message', message);
     formData.append('delaySeconds', delay.toString());
@@ -139,16 +166,36 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 pb-12">
       {/* Cabecera */}
       <header className="bg-emerald-600 text-white shadow-md">
-        <div className="max-w-6xl mx-auto px-4 py-5 flex justify-between items-center">
+        <div className="max-w-6xl mx-auto px-4 py-5 flex flex-col md:flex-row justify-between items-center gap-4">
           <div>
             <h1 className="text-2xl font-bold tracking-tight">iWassi</h1>
-            <p className="text-xs text-emerald-100 mt-1"></p>
+            <p className="text-xs text-emerald-100 mt-1">Envío masivo multisesión</p>
           </div>
-          <div className="flex items-center gap-3">
-            <span className="text-xs bg-emerald-700 px-3 py-1.5 rounded-full border border-emerald-500 text-emerald-50">
-              Servidor: {BACKEND_URL}
-            </span>
-            <div className={`w-3 h-3 rounded-full ${socketConnected ? 'bg-green-400' : 'bg-red-400'}`} title={socketConnected ? 'Socket conectado' : 'Socket desconectado'} />
+          
+          <div className="flex flex-col sm:flex-row items-center gap-3 w-full md:w-auto">
+            {/* Selector de Sesión */}
+            <div className="flex items-center gap-2 bg-emerald-700 px-3 py-1.5 rounded-xl border border-emerald-500 w-full sm:w-auto">
+              <span className="text-xs text-emerald-200 font-bold uppercase tracking-wider">Usuario:</span>
+              <select
+                value={selectedSession}
+                onChange={(e) => setSelectedSession(e.target.value)}
+                disabled={isSending}
+                className="bg-transparent text-xs text-white font-semibold outline-none cursor-pointer w-full sm:w-auto"
+              >
+                {SESSIONS.map((session) => (
+                  <option key={session.id} value={session.id} className="text-slate-800">
+                    {session.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <span className="text-xs bg-emerald-700 px-3 py-1.5 rounded-full border border-emerald-500 text-emerald-50">
+                Servidor: {BACKEND_URL}
+              </span>
+              <div className={`w-3 h-3 rounded-full ${socketConnected ? 'bg-green-400' : 'bg-red-400'}`} title={socketConnected ? 'Socket conectado' : 'Socket desconectado'} />
+            </div>
           </div>
         </div>
       </header>
@@ -157,9 +204,10 @@ export default function App() {
         
         {/* Columna Izquierda: Control de Conexión */}
         <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col h-fit">
-          <h2 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
+          <h2 className="text-lg font-bold text-slate-800 mb-1 flex items-center gap-2">
             <span>1. Estado del Canal</span>
           </h2>
+          <p className="text-xs text-slate-400 mb-4">Gestión para: <strong className="text-slate-600">{selectedSession.toUpperCase()}</strong></p>
 
           {/* Badge de estados */}
           <div className="mb-6">
@@ -168,7 +216,7 @@ export default function App() {
                 <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
                 <div>
                   <p className="font-semibold text-sm">Desconectado</p>
-                  <p className="text-xs text-red-600 mt-0.5">El motor de WhatsApp está inactivo.</p>
+                  <p className="text-xs text-red-600 mt-0.5">El motor para {selectedSession.toUpperCase()} está inactivo.</p>
                 </div>
               </div>
             )}
@@ -178,7 +226,7 @@ export default function App() {
                 <Loader2 className="w-5 h-5 animate-spin flex-shrink-0 mt-0.5 text-amber-500" />
                 <div>
                   <p className="font-semibold text-sm">Cargando Motor</p>
-                  <p className="text-xs text-amber-600 mt-0.5">Inicializando navegador local. Espera...</p>
+                  <p className="text-xs text-amber-600 mt-0.5">Inicializando navegador para {selectedSession.toUpperCase()}...</p>
                 </div>
               </div>
             )}
@@ -188,7 +236,7 @@ export default function App() {
                 <QrCode className="w-5 h-5 flex-shrink-0 mt-0.5 text-blue-500" />
                 <div>
                   <p className="font-semibold text-sm">Escaneo Requerido</p>
-                  <p className="text-xs text-blue-600 mt-0.5">Escanea el código QR inferior con WhatsApp en tu celular.</p>
+                  <p className="text-xs text-blue-600 mt-0.5">Escanea el QR con el WhatsApp de {selectedSession.toUpperCase()}.</p>
                 </div>
               </div>
             )}
@@ -209,7 +257,7 @@ export default function App() {
             <div className="flex flex-col items-center bg-slate-50 p-4 rounded-xl border border-slate-200">
               <img src={qrCode} alt="Código QR WhatsApp" className="w-48 h-48 rounded shadow-sm" />
               <p className="text-xs text-slate-500 mt-3 text-center">
-                Abre WhatsApp &gt; Dispositivos vinculados &gt; Vincular un dispositivo
+                Abre WhatsApp &gt; Dispositivos vinculados &gt; Vincular un dispositivo en el celular de {selectedSession.toUpperCase()}
               </p>
             </div>
           ) : status === 'ready' ? (
@@ -218,19 +266,19 @@ export default function App() {
                 <CheckCircle2 className="w-8 h-8" />
               </div>
               <p className="text-xs text-slate-500 text-center mb-4">
-                La sesión está guardada localmente mediante almacenamiento persistente.
+                La sesión de {selectedSession.toUpperCase()} está guardada localmente de forma independiente.
               </p>
               <button
                 onClick={handleLogout}
                 className="w-full flex items-center justify-center gap-2 px-4 py-2 border border-red-200 text-red-600 hover:bg-red-50 text-xs font-semibold rounded-lg transition-colors"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
-                Cerrar Sesión / Vincular Otro
+                Cerrar Sesión {selectedSession.toUpperCase()}
               </button>
             </div>
           ) : (
             <div className="flex items-center justify-center p-8 border border-dashed border-slate-200 rounded-xl">
-              <p className="text-xs text-slate-400 text-center">Esperando respuesta del servidor de red local...</p>
+              <p className="text-xs text-slate-400 text-center">Esperando respuesta del servidor local...</p>
             </div>
           )}
         </section>
@@ -239,7 +287,7 @@ export default function App() {
         <section className="md:col-span-2 space-y-6">
           <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
             <h2 className="text-lg font-bold text-slate-800 mb-5 flex items-center gap-2">
-              <span>2. Parámetros del Mensaje Masivo</span>
+              <span>2. Parámetros del Mensaje Masivo ({selectedSession.toUpperCase()})</span>
             </h2>
 
             <div className="space-y-4">
@@ -256,6 +304,9 @@ export default function App() {
                   rows={5}
                   className="w-full p-3 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 font-mono resize-none"
                 />
+                <span className="text-xs text-slate-500 flex justify-end mt-1">
+                  Contactos detectados: {parsedNumbersCount}
+                </span>
               </div>
 
               {/* Mensaje */}
@@ -346,7 +397,7 @@ export default function App() {
                 {isSending ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Enviando lote... ({progress.current}/{progress.total})
+                    Enviando desde {selectedSession.toUpperCase()}... ({progress.current}/{progress.total})
                   </>
                 ) : (
                   <>
@@ -362,7 +413,7 @@ export default function App() {
           {(isSending || logs.length > 0) && (
             <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 space-y-4">
               <div className="flex justify-between items-center">
-                <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Monitor de Progreso</h3>
+                <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Monitor de Progreso ({selectedSession.toUpperCase()})</h3>
                 <span className="text-xs font-mono font-bold text-slate-500">
                   {progress.current} / {progress.total}
                 </span>
@@ -408,10 +459,11 @@ export default function App() {
               Confirmar Envío Masivo
             </h3>
             <p className="text-xs text-slate-500 mt-2">
-              Vas a realizar un envío masivo de mensajes desde el número de WhatsApp con el que escaneaste el QR.
+              Vas a realizar un envío masivo de mensajes usando la sesión activa de <strong className="text-slate-700">{selectedSession.toUpperCase()}</strong>.
             </p>
             
             <div className="my-4 p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-1.5">
+              <div className="flex justify-between"><span className="text-slate-400">Canal de salida:</span> <span className="font-bold text-emerald-600">{selectedSession.toUpperCase()}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Total destinatarios:</span> <span className="font-bold">{parsedNumbersCount}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Tiempo entre envios:</span> <span className="font-bold">{delay} segundos</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Archivo Adjunto:</span> <span className="font-bold text-slate-700 truncate max-w-[200px]">{file ? file.name : 'Ninguno'}</span></div>
