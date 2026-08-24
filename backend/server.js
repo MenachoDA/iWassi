@@ -9,7 +9,8 @@ import pkg from 'whatsapp-web.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const { Client, LocalAuth, MessageMedia } = pkg;
+// Extraemos NoAuth para sesiones efímeras sin almacenamiento en disco
+const { Client, NoAuth, MessageMedia } = pkg;
 
 dotenv.config();
 
@@ -27,29 +28,26 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Configuración de almacenamiento en memoria para archivos adjuntos
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// Mapas para gestionar múltiples sesiones concurrentes
+// Mapas en memoria para sesiones dinámicas
 const activeClients = new Map();
-const sessionStates = new Map(); // Guarda el estado: { status, lastQr }
+const sessionStates = new Map(); 
+const disconnectTimers = new Map(); // Temporizadores de gracia para desconexión
 
-// Función para inicializar o recuperar un cliente de WhatsApp por sesión
+// Inicializa una instancia temporal de WhatsApp sin persistencia
 function getOrInitClient(sessionId) {
   if (activeClients.has(sessionId)) {
     return activeClients.get(sessionId);
   }
 
-  console.log(`Iniciando cliente de WhatsApp para la sesión: ${sessionId}`);
+  console.log(`Iniciando cliente temporal de WhatsApp para sesión: ${sessionId}`);
   sessionStates.set(sessionId, { status: 'authenticating', lastQr: null });
   io.to(sessionId).emit('status', { status: 'authenticating' });
 
   const client = new Client({
-    authStrategy: new LocalAuth({
-      clientId: sessionId, // Separa los datos de autenticación por usuario
-      dataPath: './.wwebjs_auth'
-    }),
+    authStrategy: new NoAuth(), // No guarda archivos ni credenciales en el servidor
     puppeteer: {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -69,34 +67,29 @@ function getOrInitClient(sessionId) {
 
   client.on('ready', () => {
     sessionStates.set(sessionId, { status: 'ready', lastQr: null });
-    console.log(`Cliente de WhatsApp listo para sesión: ${sessionId}`);
+    console.log(`Cliente listo en sesión temporal: ${sessionId}`);
     io.to(sessionId).emit('status', { status: 'ready' });
   });
 
-  client.on('authenticated', () => {
-    console.log(`Cliente autenticado para sesión: ${sessionId}`);
-  });
-
   client.on('auth_failure', (msg) => {
-    console.error(`Fallo de autenticación en sesión ${sessionId}:`, msg);
+    console.error(`Fallo de autenticación en sesión temporal ${sessionId}:`, msg);
     sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected', message: msg });
   });
 
   client.on('disconnected', (reason) => {
-    console.log(`Cliente desconectado en sesión ${sessionId}:`, reason);
+    console.log(`Cliente desvinculado en sesión temporal ${sessionId}:`, reason);
     sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected', reason });
     
     try {
       client.destroy();
     } catch (e) {}
-    
     activeClients.delete(sessionId);
   });
 
   client.initialize().catch(err => {
-    console.error(`Error al inicializar sesión ${sessionId}:`, err);
+    console.error(`Error al inicializar sesión temporal ${sessionId}:`, err);
     sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected' });
   });
@@ -105,20 +98,25 @@ function getOrInitClient(sessionId) {
   return client;
 }
 
-// Manejo de conexiones de WebSocket por salas (rooms)
+// Configuración de conexiones de WebSockets
 io.on('connection', (socket) => {
-  console.log('Cliente web conectado vía Socket.IO ID:', socket.id);
   
   socket.on('join-session', ({ sessionId }) => {
     if (!sessionId) return;
     
+    socket.sessionId = sessionId;
     socket.join(sessionId);
-    console.log(`Socket ${socket.id} unido a sala de sesión: ${sessionId}`);
+    console.log(`Socket unido a sesión temporal: ${sessionId}`);
 
-    // Inicializar el cliente correspondiente si no existe
+    // Si había un temporizador de destrucción para esta pestaña, se cancela (el usuario refrescó la página)
+    if (disconnectTimers.has(sessionId)) {
+      clearTimeout(disconnectTimers.get(sessionId));
+      disconnectTimers.delete(sessionId);
+      console.log(`Reconexión rápida detectada. Cancelado temporizador de cierre para: ${sessionId}`);
+    }
+
     getOrInitClient(sessionId);
 
-    // Enviar estado actual de esta sesión específica
     const state = sessionStates.get(sessionId);
     if (state) {
       socket.emit('status', { status: state.status });
@@ -127,9 +125,34 @@ io.on('connection', (socket) => {
       }
     }
   });
+
+  // Si la pestaña se cierra o el ordenador remoto se apaga
+  socket.on('disconnect', () => {
+    const sessionId = socket.sessionId;
+    if (sessionId) {
+      console.log(`Pestaña desconectada para sesión ${sessionId}. Esperando 15 segundos antes de destruir...`);
+      
+      const timer = setTimeout(async () => {
+        console.log(`Tiempo de gracia cumplido. Destruyendo sesión de WhatsApp de forma segura: ${sessionId}`);
+        const client = activeClients.get(sessionId);
+        if (client) {
+          try {
+            await client.destroy(); // Apaga Puppeteer y libera la memoria RAM
+          } catch (e) {
+            console.error(`Error al cerrar cliente temporal ${sessionId}:`, e);
+          }
+          activeClients.delete(sessionId);
+        }
+        sessionStates.delete(sessionId);
+        disconnectTimers.delete(sessionId);
+      }, 15000); // 15 segundos de tolerancia
+      
+      disconnectTimers.set(sessionId, timer);
+    }
+  });
 });
 
-// Función auxiliar para formatear los números de teléfono (Preservada intacta)
+// Función auxiliar para formatear los números de teléfono (Perú)
 function formatPhoneNumber(num) {
   let cleaned = num.replace(/\D/g, '');
 
@@ -146,13 +169,11 @@ function formatPhoneNumber(num) {
   return cleaned;
 }
 
-// Helper para pausar la ejecución
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Endpoint para reiniciar el cliente / cerrar sesión
+// Endpoint para reiniciar el cliente / desvincular
 app.post('/api/logout', async (req, res) => {
   const { sessionId } = req.body;
-  
   if (!sessionId) {
     return res.status(400).json({ success: false, error: 'Se requiere el identificador de sesión' });
   }
@@ -160,15 +181,12 @@ app.post('/api/logout', async (req, res) => {
   try {
     const client = activeClients.get(sessionId);
     if (client) {
-      await client.logout();
       await client.destroy();
       activeClients.delete(sessionId);
     }
-    
     sessionStates.delete(sessionId);
     getOrInitClient(sessionId);
-    
-    res.json({ success: true, message: `Sesión ${sessionId} cerrada e inicializando nuevo código QR` });
+    res.json({ success: true, message: 'Sesión temporal cerrada correctamente' });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -187,14 +205,13 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
   const state = sessionStates.get(sessionId);
 
   if (!client || !state || state.status !== 'ready') {
-    return res.status(400).json({ success: false, error: 'El canal de WhatsApp seleccionado no está listo' });
+    return res.status(400).json({ success: false, error: 'El servicio de WhatsApp temporal no está listo' });
   }
 
   if (!rawNumbers || !message) {
     return res.status(400).json({ success: false, error: 'Números y mensaje son campos obligatorios' });
   }
 
-  // Procesar lista de números
   const numbers = rawNumbers
     .split(/[\n,]+/)
     .map(num => num.trim())
@@ -206,10 +223,8 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     return res.status(400).json({ success: false, error: 'No se encontraron números válidos' });
   }
 
-  // Responder inmediatamente que el proceso ha iniciado
   res.json({ success: true, message: 'Proceso de envío masivo iniciado', total: numbers.length });
 
-  // Ejecución en segundo plano independiente por sesión
   (async () => {
     let media = null;
     if (file) {
@@ -232,7 +247,6 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
           await client.sendMessage(formattedNum, message);
         }
 
-        // Emitir el progreso a la sala correspondiente a esta sesión
         io.to(sessionId).emit('progress', {
           current: i + 1,
           total: numbers.length,
@@ -242,7 +256,7 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
           error: null
         });
       } catch (error) {
-        console.error(`[Sesión ${sessionId}] Error enviando a ${rawNum}:`, error);
+        console.error(`[Sesión ${sessionId}] Error:`, error);
         io.to(sessionId).emit('progress', {
           current: i + 1,
           total: numbers.length,
@@ -260,20 +274,14 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
   })();
 });
 
-// ==========================================
 // CONFIGURACIÓN PARA SERVIR EL FRONTEND UNIFICADO
-// ==========================================
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Servir los archivos estáticos de la carpeta dist del frontend
 app.use(express.static(path.join(__dirname, '../frontend/dist')));
 
-// Cualquier ruta que no coincida con la API redirigirá al index.html de React
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend/dist/index.html'));
 });
-// ==========================================
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Servidor escuchando en http://localhost:${PORT}`);
