@@ -33,7 +33,7 @@ const upload = multer({ storage: storage });
 
 // Mapas en memoria para sesiones dinámicas
 const activeClients = new Map();
-const sessionStates = new Map(); 
+const sessionStates = new Map();
 const disconnectTimers = new Map(); // Temporizadores de gracia para desconexión
 
 // Inicializa una instancia temporal de WhatsApp sin persistencia
@@ -81,10 +81,10 @@ function getOrInitClient(sessionId) {
     console.log(`Cliente desvinculado en sesión temporal ${sessionId}:`, reason);
     sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected', reason });
-    
+
     try {
       client.destroy();
-    } catch (e) {}
+    } catch (e) { }
     activeClients.delete(sessionId);
   });
 
@@ -100,10 +100,10 @@ function getOrInitClient(sessionId) {
 
 // Configuración de conexiones de WebSockets
 io.on('connection', (socket) => {
-  
+
   socket.on('join-session', ({ sessionId }) => {
     if (!sessionId) return;
-    
+
     socket.sessionId = sessionId;
     socket.join(sessionId);
     console.log(`Socket unido a sesión temporal: ${sessionId}`);
@@ -131,7 +131,7 @@ io.on('connection', (socket) => {
     const sessionId = socket.sessionId;
     if (sessionId) {
       console.log(`Pestaña desconectada para sesión ${sessionId}. Esperando 15 segundos antes de destruir...`);
-      
+
       const timer = setTimeout(async () => {
         console.log(`Tiempo de gracia cumplido. Destruyendo sesión de WhatsApp de forma segura: ${sessionId}`);
         const client = activeClients.get(sessionId);
@@ -146,7 +146,7 @@ io.on('connection', (socket) => {
         sessionStates.delete(sessionId);
         disconnectTimers.delete(sessionId);
       }, 15000); // 15 segundos de tolerancia
-      
+
       disconnectTimers.set(sessionId, timer);
     }
   });
@@ -156,7 +156,7 @@ io.on('connection', (socket) => {
 function formatPhoneNumber(num) {
   let cleaned = num.replace(/\D/g, '');
 
-  if(cleaned.length === 9){
+  if (cleaned.length === 9) {
     cleaned = `51${cleaned}`;
   }
   else if (cleaned.length > 9 && !cleaned.startsWith('51')) {
@@ -194,7 +194,7 @@ app.post('/api/logout', async (req, res) => {
 
 // Endpoint para procesar el envío masivo
 app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
-  const { sessionId, numbers: rawNumbers, message, delaySeconds } = req.body;
+  const { sessionId, numbers: rawNumbers, message, delaySeconds, scheduledDate } = req.body;
   const file = req.file;
 
   if (!sessionId) {
@@ -223,9 +223,30 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     return res.status(400).json({ success: false, error: 'No se encontraron números válidos' });
   }
 
+  let waitMs = 0;
+  if (scheduledDate) {
+    const targetDate = new Date(scheduledDate);
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({ success: false, error: 'La fecha programada no es válida' });
+    }
+    waitMs = targetDate.getTime() - Date.now();
+    if (waitMs < 0) {
+      return res.status(400).json({ success: false, error: 'La fecha programada no puede ser anterior a la fecha actual' });
+    }
+  }
+
   res.json({ success: true, message: 'Proceso de envío masivo iniciado', total: numbers.length });
 
   (async () => {
+    if (waitMs > 0) {
+      io.to(sessionId).emit('waiting_schedule', {
+        scheduledDate,
+        message: 'Esperando a la hora programada...'
+      });
+      console.log(`[Sesión ${sessionId}] Esperando ${Math.round(waitMs / 1000)}s para envío programado.`);
+      await delay(waitMs);
+    }
+
     let media = null;
     if (file) {
       media = new MessageMedia(

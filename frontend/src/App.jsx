@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
-import { 
-  CheckCircle2, 
-  XCircle, 
-  Loader2, 
-  QrCode, 
-  AlertTriangle, 
-  Send, 
-  FileUp, 
-  Trash2, 
+import {
+  CheckCircle2,
+  XCircle,
+  Loader2,
+  QrCode,
+  AlertTriangle,
+  Send,
+  FileUp,
+  Trash2,
   RefreshCw,
   Info
 } from 'lucide-react';
@@ -41,9 +41,12 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [delay, setDelay] = useState(30);
   const [file, setFile] = useState(null);
-  
+
   // Estado de Envío y Progreso
   const [isSending, setIsSending] = useState(false);
+  const [isScheduledWaiting, setIsScheduledWaiting] = useState(false);
+  const [dispatchMode, setDispatchMode] = useState('immediate');
+  const [scheduledDateTime, setScheduledDateTime] = useState('');
   const [showConfirm, setShowConfirm] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [logs, setLogs] = useState([]);
@@ -76,12 +79,18 @@ export default function App() {
     });
 
     socketRef.current.on('progress', (data) => {
+      setIsScheduledWaiting(false);
       setProgress({ current: data.current, total: data.total });
       setLogs((prev) => [data, ...prev]);
-      
+
       if (data.current === data.total) {
         setIsSending(false);
       }
+    });
+
+    socketRef.current.on('waiting_schedule', (data) => {
+      setIsScheduledWaiting(true);
+      setLogs((prev) => [{ status: 'info', number: 'Sistema', time: new Date().toLocaleTimeString(), error: data.message }, ...prev]);
     });
 
     return () => {
@@ -102,7 +111,7 @@ export default function App() {
   const handleLogout = async () => {
     if (window.confirm('¿Seguro que deseas cerrar sesión de forma inmediata? Se perderá la vinculación de este celular.')) {
       try {
-        const response = await fetch(`${BACKEND_URL}/api/logout`, { 
+        const response = await fetch(`${BACKEND_URL}/api/logout`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sessionId: sessionId })
@@ -121,6 +130,7 @@ export default function App() {
   const startSending = async () => {
     setShowConfirm(false);
     setIsSending(true);
+    setIsScheduledWaiting(false);
     setProgress({ current: 0, total: 0 });
     setLogs([]);
 
@@ -129,6 +139,12 @@ export default function App() {
     formData.append('numbers', numbers);
     formData.append('message', message);
     formData.append('delaySeconds', delay.toString());
+
+    if (dispatchMode === 'scheduled' && scheduledDateTime) {
+      const date = new Date(scheduledDateTime);
+      formData.append('scheduledDate', date.toISOString());
+    }
+
     if (file) {
       formData.append('attachment', file);
     }
@@ -155,6 +171,13 @@ export default function App() {
     .map(n => n.trim())
     .filter(n => n.length > 0).length;
 
+  const isScheduleValid = () => {
+    if (dispatchMode === 'immediate') return true;
+    if (!scheduledDateTime) return false;
+    const scheduleDate = new Date(scheduledDateTime);
+    return scheduleDate.getTime() > Date.now();
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 pb-12">
       {/* Cabecera */}
@@ -173,7 +196,7 @@ export default function App() {
       </header>
 
       <main className="max-w-6xl mx-auto px-4 mt-8 grid grid-cols-1 md:grid-cols-3 gap-6">
-        
+
         {/* Columna Izquierda: Control de Conexión */}
         <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 flex flex-col h-fit">
           <h2 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
@@ -280,6 +303,61 @@ export default function App() {
                 </span>
               </div>
 
+              {/* Modo de Envío */}
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-2">
+                  Modo de Envío
+                </label>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="dispatchMode"
+                      value="immediate"
+                      checked={dispatchMode === 'immediate'}
+                      onChange={() => setDispatchMode('immediate')}
+                      disabled={status !== 'ready' || isSending}
+                      className="accent-emerald-600 w-4 h-4"
+                    />
+                    <span className="text-sm text-slate-700">Inmediato</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="dispatchMode"
+                      value="scheduled"
+                      checked={dispatchMode === 'scheduled'}
+                      onChange={() => setDispatchMode('scheduled')}
+                      disabled={status !== 'ready' || isSending}
+                      className="accent-emerald-600 w-4 h-4"
+                    />
+                    <span className="text-sm text-slate-700">Programado</span>
+                  </label>
+                </div>
+
+                {dispatchMode === 'scheduled' && (
+                  <div className="mt-3 p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                    <div>
+                      <label className="block text-xs text-slate-600 mb-1">Fecha y Hora de inicio</label>
+                      <input
+                        type="datetime-local"
+                        value={scheduledDateTime}
+                        onChange={(e) => setScheduledDateTime(e.target.value)}
+                        disabled={status !== 'ready' || isSending}
+                        className="w-full p-2 text-sm border border-slate-200 rounded-lg focus:ring-2 focus:ring-emerald-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="flex items-start gap-2 bg-amber-50 p-2 rounded-lg border border-amber-200 text-amber-800 text-xs">
+                      <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                      <p>
+                        <strong>Importante:</strong> Esta pestaña debe permanecer abierta hasta que empiece y finalice el envío programado.
+                        Si cierras la pestaña, la conexión de WhatsApp se destruirá y el envío fallará.
+                      </p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               {/* Mensaje */}
               <div>
                 <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
@@ -321,7 +399,7 @@ export default function App() {
                 <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
                   Documento / Imagen Adjunta (Opcional)
                 </label>
-                
+
                 {!file ? (
                   <div className="border-2 border-dashed border-slate-200 hover:border-emerald-500 hover:bg-slate-50 rounded-xl p-4 transition-colors relative cursor-pointer">
                     <input
@@ -362,18 +440,18 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowConfirm(true)}
-                disabled={status !== 'ready' || isSending || parsedNumbersCount === 0 || !message}
+                disabled={status !== 'ready' || isSending || parsedNumbersCount === 0 || !message || !isScheduleValid()}
                 className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm py-3 px-4 rounded-xl shadow-md transition-all flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {isSending ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Enviando lote... ({progress.current}/{progress.total})
+                    {isScheduledWaiting ? 'Esperando inicio...' : `Enviando lote... (${progress.current}/${progress.total})`}
                   </>
                 ) : (
                   <>
                     <Send className="w-4 h-4" />
-                    Iniciar Envío Masivo
+                    {dispatchMode === 'scheduled' ? 'Programar Envío' : 'Iniciar Envío Masivo'}
                   </>
                 )}
               </button>
@@ -392,7 +470,7 @@ export default function App() {
 
               {/* Barra de progreso */}
               <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
-                <div 
+                <div
                   className="bg-emerald-500 h-full transition-all duration-300"
                   style={{ width: `${(progress.current / progress.total) * 100}%` }}
                 />
@@ -406,6 +484,8 @@ export default function App() {
                     <div className="flex items-center gap-2">
                       {log.status === 'Enviado' ? (
                         <span className="text-green-400 font-bold">[OK]</span>
+                      ) : log.status === 'info' ? (
+                        <span className="text-blue-400 font-bold">[INFO]</span>
                       ) : (
                         <span className="text-red-400 font-bold">[ERROR]</span>
                       )}
@@ -432,10 +512,16 @@ export default function App() {
             <p className="text-xs text-slate-500 mt-2">
               Vas a realizar un envío masivo de mensajes desde el número de WhatsApp con el que escaneaste el QR.
             </p>
-            
+
             <div className="my-4 p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-1.5">
               <div className="flex justify-between"><span className="text-slate-400">Total de destinatarios:</span> <span className="font-bold">{parsedNumbersCount}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Tiempo entre envíos:</span> <span className="font-bold">{delay} segundos</span></div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Modo de inicio:</span>
+                <span className="font-bold">
+                  {dispatchMode === 'immediate' ? 'Inmediato' : new Date(scheduledDateTime).toLocaleString()}
+                </span>
+              </div>
               <div className="flex justify-between"><span className="text-slate-400">Archivo Adjunto:</span> <span className="font-bold text-slate-700 truncate max-w-[200px]">{file ? file.name : 'Ninguno'}</span></div>
             </div>
 
