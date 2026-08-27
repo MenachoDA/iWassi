@@ -194,7 +194,7 @@ app.post('/api/logout', async (req, res) => {
 
 // Endpoint para procesar el envío masivo
 app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
-  const { sessionId, numbers: rawNumbers, message, delaySeconds, scheduledDate } = req.body;
+  const { sessionId, numbers: rawNumbers, dnis: rawDnis, message, delaySeconds, scheduledDate } = req.body;
   const file = req.file;
 
   if (!sessionId) {
@@ -208,8 +208,8 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     return res.status(400).json({ success: false, error: 'El servicio de WhatsApp temporal no está listo' });
   }
 
-  if (!rawNumbers || !message) {
-    return res.status(400).json({ success: false, error: 'Números y mensaje son campos obligatorios' });
+  if (!rawNumbers || !rawDnis || !message) {
+    return res.status(400).json({ success: false, error: 'Números, DNIs y mensaje son campos obligatorios' });
   }
 
   const numbers = rawNumbers
@@ -217,11 +217,24 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     .map(num => num.trim())
     .filter(num => num.length > 0);
 
-  const parsedDelay = Math.max(parseInt(delaySeconds, 10) || 30, 2) * 1000;
+  const dnis = (rawDnis || '')
+    .split(/[\n,]+/)
+    .map(dni => dni.trim())
+    .filter(dni => dni.length > 0);
 
   if (numbers.length === 0) {
     return res.status(400).json({ success: false, error: 'No se encontraron números válidos' });
   }
+
+  if (numbers.length !== dnis.length) {
+    return res.status(400).json({ success: false, error: 'La cantidad de números no coincide con la cantidad de DNIs' });
+  }
+
+  if (!dnis.every(dni => /^\d{8}$/.test(dni))) {
+    return res.status(400).json({ success: false, error: 'Todos los DNIs deben contener exactamente 8 dígitos numéricos' });
+  }
+
+  const parsedDelay = Math.max(parseInt(delaySeconds, 10) || 30, 2) * 1000;
 
   let waitMs = 0;
   if (scheduledDate) {

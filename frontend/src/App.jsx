@@ -38,6 +38,7 @@ export default function App() {
 
   // Estados del Formulario de Envío
   const [numbers, setNumbers] = useState('');
+  const [dnis, setDnis] = useState('');
   const [message, setMessage] = useState('');
   const [delay, setDelay] = useState(30);
   const [file, setFile] = useState(null);
@@ -137,6 +138,7 @@ export default function App() {
     const formData = new FormData();
     formData.append('sessionId', sessionId);
     formData.append('numbers', numbers);
+    formData.append('dnis', dnis);
     formData.append('message', message);
     formData.append('delaySeconds', delay.toString());
 
@@ -166,10 +168,21 @@ export default function App() {
     }
   };
 
-  const parsedNumbersCount = numbers
+  const parsedNumbers = numbers
     .split(/[\n,]+/)
     .map(n => n.trim())
-    .filter(n => n.length > 0).length;
+    .filter(n => n.length > 0);
+  const parsedNumbersCount = parsedNumbers.length;
+
+  const parsedDnisList = dnis
+    .split(/[\n,]+/)
+    .map(n => n.trim())
+    .filter(n => n.length > 0);
+  const parsedDnisCount = parsedDnisList.length;
+
+  const isDniValid = parsedDnisList.every(dni => /^\d{8}$/.test(dni));
+  const isCountMatch = parsedNumbersCount === parsedDnisCount;
+  const hasValidationErrors = (parsedNumbersCount > 0 || parsedDnisCount > 0) && (!isCountMatch || (parsedDnisCount > 0 && !isDniValid));
 
   const isScheduleValid = () => {
     if (dispatchMode === 'immediate') return true;
@@ -285,22 +298,63 @@ export default function App() {
             </h2>
 
             <div className="space-y-4">
-              {/* Números */}
+              {/* Números y DNIs */}
               <div>
-                <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
-                  Destinatarios (un número por línea)
-                </label>
-                <textarea
-                  disabled={status !== 'ready' || isSending}
-                  value={numbers}
-                  onChange={(e) => setNumbers(e.target.value)}
-                  placeholder="Ejemplo:&#10;922018420&#10;999888777"
-                  rows={5}
-                  className="w-full p-3 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 font-mono resize-none"
-                />
-                <span className="text-xs text-slate-500 flex justify-end mt-1">
-                  Contactos detectados: {parsedNumbersCount}
-                </span>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
+                      Destinatarios (un número por línea)
+                    </label>
+                    <textarea
+                      disabled={status !== 'ready' || isSending}
+                      value={numbers}
+                      onChange={(e) => setNumbers(e.target.value)}
+                      placeholder="Ejemplo:&#10;922018420&#10;999888777"
+                      rows={5}
+                      className="w-full p-3 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 font-mono resize-none"
+                    />
+                    <span className="text-xs text-slate-500 flex justify-end mt-1">
+                      Contactos detectados: {parsedNumbersCount}
+                    </span>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
+                      DNIs (un DNI por línea)
+                    </label>
+                    <textarea
+                      disabled={status !== 'ready' || isSending}
+                      value={dnis}
+                      onChange={(e) => setDnis(e.target.value)}
+                      placeholder="Ejemplo:&#10;12345678&#10;87654321"
+                      rows={5}
+                      className={`w-full p-3 text-sm border ${!isDniValid && parsedDnisCount > 0 ? 'border-red-400 focus:ring-red-500' : 'border-slate-200 focus:ring-emerald-500'} rounded-xl focus:ring-2 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 font-mono resize-none`}
+                    />
+                    <span className="text-xs text-slate-500 flex justify-end mt-1">
+                      DNIs detectados: {parsedDnisCount}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-start gap-2 bg-blue-50 p-3 rounded-xl border border-blue-100 text-blue-800 text-xs mt-3">
+                  <Info className="w-4 h-4 flex-shrink-0 mt-0.5 text-blue-500" />
+                  <p>
+                    <strong>Instrucción:</strong> Las entradas deben seguir exactamente el mismo orden en ambos campos (ej. el 1er DNI corresponde al 1er número de teléfono, el 2do DNI al 2do número de teléfono, etc.).
+                  </p>
+                </div>
+
+                {hasValidationErrors && (
+                  <div className="flex items-start gap-2 bg-red-50 p-3 rounded-xl border border-red-100 text-red-800 text-xs mt-3">
+                    <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5 text-red-500" />
+                    <div className="flex flex-col gap-1">
+                      {!isCountMatch && (
+                        <p><strong>Error de Cantidad:</strong> El número de destinatarios ({parsedNumbersCount}) no coincide con la cantidad de DNIs ingresados ({parsedDnisCount}).</p>
+                      )}
+                      {parsedDnisCount > 0 && !isDniValid && (
+                        <p><strong>Error de Formato:</strong> Cada DNI debe contener exactamente 8 dígitos numéricos (sin letras ni caracteres especiales).</p>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Modo de Envío */}
@@ -440,7 +494,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowConfirm(true)}
-                disabled={status !== 'ready' || isSending || parsedNumbersCount === 0 || !message || !isScheduleValid()}
+                disabled={status !== 'ready' || isSending || parsedNumbersCount === 0 || !message || !isScheduleValid() || hasValidationErrors}
                 className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm py-3 px-4 rounded-xl shadow-md transition-all flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {isSending ? (
