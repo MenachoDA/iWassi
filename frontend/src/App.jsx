@@ -10,7 +10,8 @@ import {
   FileUp,
   Trash2,
   RefreshCw,
-  Info
+  Info,
+  FileSpreadsheet
 } from 'lucide-react';
 
 const BACKEND_URL = window.location.origin;
@@ -42,6 +43,8 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [delay, setDelay] = useState(30);
   const [file, setFile] = useState(null);
+  const [contactsFile, setContactsFile] = useState(null);
+  const [contactsFileError, setContactsFileError] = useState('');
 
   // Estado de Envío y Progreso
   const [isSending, setIsSending] = useState(false);
@@ -107,6 +110,74 @@ export default function App() {
 
   const removeFile = () => {
     setFile(null);
+  };
+
+  const handleContactsFileUpload = (e) => {
+    if (!e.target.files || !e.target.files[0]) return;
+    const uploadedFile = e.target.files[0];
+    setContactsFileError('');
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const text = event.target.result || '';
+      const lines = text.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+
+      if (lines.length === 0) {
+        setContactsFileError('El archivo seleccionado está vacío.');
+        return;
+      }
+
+      const headerLine = lines[0];
+      let delimiter = ',';
+      if (headerLine.includes(';')) delimiter = ';';
+      else if (headerLine.includes('\t')) delimiter = '\t';
+      else if (headerLine.includes(',')) delimiter = ',';
+
+      const headers = headerLine.split(delimiter).map(h => h.trim().replace(/^["']|["']$/g, '').toLowerCase());
+
+      const phoneIndex = headers.findIndex(h => h.includes('telefono') || h.includes('teléfono') || h.includes('phone') || h.includes('celular'));
+      const dniIndex = headers.findIndex(h => h.includes('dni') || h.includes('cedula') || h.includes('identificacion'));
+
+      if (phoneIndex === -1 || dniIndex === -1) {
+        setContactsFileError('El archivo debe contener obligatoriamente las columnas "Telefono" y "DNI" en la primera fila.');
+        return;
+      }
+
+      const extractedNumbers = [];
+      const extractedDnis = [];
+
+      for (let i = 1; i < lines.length; i++) {
+        const row = lines[i].split(delimiter).map(cell => cell.trim().replace(/^["']|["']$/g, ''));
+        const phone = row[phoneIndex] || '';
+        const dni = row[dniIndex] || '';
+
+        if (phone || dni) {
+          extractedNumbers.push(phone);
+          extractedDnis.push(dni);
+        }
+      }
+
+      if (extractedNumbers.length === 0) {
+        setContactsFileError('No se encontraron registros de teléfonos y DNIs en el archivo.');
+        return;
+      }
+
+      setNumbers(extractedNumbers.join('\n'));
+      setDnis(extractedDnis.join('\n'));
+      setContactsFile({ name: uploadedFile.name, count: extractedNumbers.length });
+    };
+
+    reader.onerror = () => {
+      setContactsFileError('Error al leer el archivo.');
+    };
+
+    reader.readAsText(uploadedFile);
+    e.target.value = '';
+  };
+
+  const removeContactsFile = () => {
+    setContactsFile(null);
+    setContactsFileError('');
   };
 
   const handleLogout = async () => {
@@ -333,6 +404,60 @@ export default function App() {
                       DNIs detectados: {parsedDnisCount}
                     </span>
                   </div>
+                </div>
+
+                {/* Adjuntar Lista de Contactos (.csv / .txt) */}
+                <div className="mt-3">
+                  {!contactsFile ? (
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 bg-slate-50 p-3 rounded-xl border border-slate-200">
+                      <label className="relative inline-flex items-center justify-center gap-2 bg-white hover:bg-slate-100 text-slate-700 font-semibold text-xs py-2 px-3.5 rounded-lg border border-slate-300 cursor-pointer shadow-sm transition-colors disabled:opacity-50">
+                        <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                        <span>Adjuntar lista (.csv, .txt)</span>
+                        <input
+                          type="file"
+                          accept=".csv,.txt"
+                          disabled={status !== 'ready' || isSending}
+                          onChange={handleContactsFileUpload}
+                          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
+                        />
+                      </label>
+                      <span className="text-[11px] text-slate-500">
+                        El archivo debe incluir las columnas "Telefono" y "DNI".
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-between p-3 bg-emerald-50 border border-emerald-200 rounded-xl">
+                      <div className="flex items-center gap-2.5 overflow-hidden">
+                        <div className="p-2 bg-emerald-100 text-emerald-700 rounded-lg">
+                          <FileSpreadsheet className="w-4 h-4" />
+                        </div>
+                        <div className="overflow-hidden">
+                          <p className="text-xs font-semibold text-emerald-900 truncate">
+                            {contactsFile.name}
+                          </p>
+                          <p className="text-[10px] text-emerald-700 font-medium">
+                            {contactsFile.count} contactos y DNIs cargados correctamente
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isSending}
+                        onClick={removeContactsFile}
+                        className="text-slate-400 hover:text-red-500 p-1.5 rounded transition-colors"
+                        title="Quitar lista cargada"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  )}
+
+                  {contactsFileError && (
+                    <div className="flex items-center gap-2 bg-red-50 p-3 rounded-xl border border-red-200 text-red-700 text-xs mt-2">
+                      <XCircle className="w-4 h-4 flex-shrink-0 text-red-500" />
+                      <span>{contactsFileError}</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex items-start gap-2 bg-blue-50 p-3 rounded-xl border border-blue-100 text-blue-800 text-xs mt-3">
