@@ -40,7 +40,9 @@ export default function App() {
   // Estados del Formulario de Envío
   const [numbers, setNumbers] = useState('');
   const [dnis, setDnis] = useState('');
-  const [message, setMessage] = useState('');
+  const [message1, setMessage1] = useState('');
+  const [message2, setMessage2] = useState('');
+  const [message3, setMessage3] = useState('');
   const [delay, setDelay] = useState(30);
   const [file, setFile] = useState(null);
   const [contactsFile, setContactsFile] = useState(null);
@@ -206,11 +208,16 @@ export default function App() {
     setProgress({ current: 0, total: 0 });
     setLogs([]);
 
+    const validMessages = [message1, message2, message3]
+      .map(m => m.trim())
+      .filter(m => m.length > 0);
+
     const formData = new FormData();
     formData.append('sessionId', sessionId);
     formData.append('numbers', numbers);
     formData.append('dnis', dnis);
-    formData.append('message', message);
+    formData.append('messages', JSON.stringify(validMessages));
+    formData.append('message', validMessages[0] || '');
     formData.append('delaySeconds', delay.toString());
 
     if (dispatchMode === 'scheduled' && scheduledDateTime) {
@@ -238,6 +245,10 @@ export default function App() {
       setIsSending(false);
     }
   };
+
+  const validMessages = [message1, message2, message3]
+    .map(m => m.trim())
+    .filter(m => m.length > 0);
 
   const parsedNumbers = numbers
     .split(/[\n,]+/)
@@ -537,19 +548,54 @@ export default function App() {
                 )}
               </div>
 
-              {/* Mensaje */}
+              {/* Mensajes a Enviar (Rotación Aleatoria) */}
               <div>
-                <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
-                  Mensaje a Enviar
-                </label>
-                <textarea
-                  disabled={status !== 'ready' || isSending}
-                  value={message}
-                  onChange={(e) => setMessage(e.target.value)}
-                  placeholder="Escribe el mensaje aquí..."
-                  rows={4}
-                  className="w-full p-3 text-sm border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 resize-none"
-                />
+                <div className="flex justify-between items-center mb-1.5">
+                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-600">
+                    Mensajes a Enviar (Rotación Aleatoria)
+                  </label>
+                  <span className="text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md font-semibold">
+                    {validMessages.length} {validMessages.length === 1 ? 'mensaje activo' : 'mensajes activos'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500 mb-2">
+                  Ingresa hasta 3 variantes de mensaje. Cada envío alternará aleatoriamente entre los mensajes completados.
+                </p>
+                <div className="space-y-2">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Mensaje 1 (Principal)</label>
+                    <textarea
+                      disabled={status !== 'ready' || isSending}
+                      value={message1}
+                      onChange={(e) => setMessage1(e.target.value)}
+                      placeholder="Escribe la primera variante del mensaje..."
+                      rows={2}
+                      className="w-full p-2.5 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 resize-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Mensaje 2 (Opcional)</label>
+                    <textarea
+                      disabled={status !== 'ready' || isSending}
+                      value={message2}
+                      onChange={(e) => setMessage2(e.target.value)}
+                      placeholder="Escribe la segunda variante del mensaje..."
+                      rows={2}
+                      className="w-full p-2.5 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 resize-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Mensaje 3 (Opcional)</label>
+                    <textarea
+                      disabled={status !== 'ready' || isSending}
+                      value={message3}
+                      onChange={(e) => setMessage3(e.target.value)}
+                      placeholder="Escribe la tercera variante del mensaje..."
+                      rows={2}
+                      className="w-full p-2.5 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-emerald-500 focus:outline-none disabled:bg-slate-50 disabled:text-slate-400 resize-none"
+                    />
+                  </div>
+                </div>
               </div>
 
               {/* Retraso */}
@@ -619,7 +665,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowConfirm(true)}
-                disabled={status !== 'ready' || isSending || parsedNumbersCount === 0 || !message || !isScheduleValid() || hasValidationErrors}
+                disabled={status !== 'ready' || isSending || parsedNumbersCount === 0 || validMessages.length === 0 || !isScheduleValid() || hasValidationErrors}
                 className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-sm py-3 px-4 rounded-xl shadow-md transition-all flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 {isSending ? (
@@ -694,6 +740,7 @@ export default function App() {
 
             <div className="my-4 p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-1.5">
               <div className="flex justify-between"><span className="text-slate-400">Total de destinatarios:</span> <span className="font-bold">{parsedNumbersCount}</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Variantes de mensaje:</span> <span className="font-bold">{validMessages.length} {validMessages.length === 1 ? 'mensaje (fijo)' : 'mensajes (aleatorios)'}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Tiempo entre envíos:</span> <span className="font-bold">{delay} segundos</span></div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Modo de inicio:</span>
