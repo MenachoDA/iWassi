@@ -194,7 +194,7 @@ app.post('/api/logout', async (req, res) => {
 
 // Endpoint para procesar el envío masivo
 app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
-  const { sessionId, numbers: rawNumbers, dnis: rawDnis, message, delaySeconds, scheduledDate } = req.body;
+  const { sessionId, numbers: rawNumbers, dnis: rawDnis, message, messages: rawMessages, delaySeconds, scheduledDate } = req.body;
   const file = req.file;
 
   if (!sessionId) {
@@ -208,8 +208,29 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     return res.status(400).json({ success: false, error: 'El servicio de WhatsApp temporal no está listo' });
   }
 
-  if (!rawNumbers || !rawDnis || !message) {
-    return res.status(400).json({ success: false, error: 'Números, DNIs y mensaje son campos obligatorios' });
+  let messagesList = [];
+  if (rawMessages) {
+    try {
+      messagesList = typeof rawMessages === 'string' ? JSON.parse(rawMessages) : rawMessages;
+    } catch (e) {
+      messagesList = Array.isArray(rawMessages) ? rawMessages : [rawMessages];
+    }
+  }
+  if (!Array.isArray(messagesList) || messagesList.length === 0) {
+    if (message) {
+      messagesList = [message];
+    }
+  }
+  messagesList = messagesList
+    .map(m => (typeof m === 'string' ? m.trim() : ''))
+    .filter(m => m.length > 0);
+
+  if (messagesList.length === 0) {
+    return res.status(400).json({ success: false, error: 'Debes proporcionar al menos un mensaje' });
+  }
+
+  if (!rawNumbers || !rawDnis) {
+    return res.status(400).json({ success: false, error: 'Números y DNIs son campos obligatorios' });
   }
 
   const numbers = rawNumbers
@@ -274,11 +295,14 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
       const formattedNum = formatPhoneNumber(rawNum);
       const timestamp = new Date().toLocaleTimeString();
 
+      // Seleccionar aleatoriamente un mensaje de las variantes ingresadas
+      const selectedMessage = messagesList[Math.floor(Math.random() * messagesList.length)];
+
       try {
         if (media) {
-          await client.sendMessage(formattedNum, media, { caption: message });
+          await client.sendMessage(formattedNum, media, { caption: selectedMessage });
         } else {
-          await client.sendMessage(formattedNum, message);
+          await client.sendMessage(formattedNum, selectedMessage);
         }
 
         io.to(sessionId).emit('progress', {
