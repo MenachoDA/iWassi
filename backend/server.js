@@ -8,11 +8,13 @@ import qrcode from 'qrcode';
 import pkg from 'whatsapp-web.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import sql from 'mssql';
+
+// Cargar variables de entorno
+dotenv.config();
 
 // Extraemos NoAuth para sesiones efímeras sin almacenamiento en disco
 const { Client, NoAuth, MessageMedia } = pkg;
-
-dotenv.config();
 
 const app = express();
 const server = createServer(app);
@@ -24,6 +26,33 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
+const USE_DB = process.env.USE_DB === 'true'; // Variable que controla el entorno
+
+let poolPromise = null;
+
+if (USE_DB) {
+  // CONFIGURACIÓN DE LA BASE DE DATOS SQL SERVER DESDE .ENV
+  const dbConfig = {
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    server: process.env.DB_SERVER,
+    database: process.env.DB_NAME,
+    options: {
+      encrypt: process.env.DB_ENCRYPT === 'true',
+      trustServerCertificate: process.env.DB_TRUST_CERT === 'true'
+    }
+  };
+
+  // Crear el pool de conexión a la BD
+  poolPromise = sql.connect(dbConfig).then(pool => {
+    console.log('Conectado a SQL Server exitosamente.');
+    return pool;
+  }).catch(err => {
+    console.error('Error al conectar a SQL Server:', err);
+  });
+} else {
+  console.log('Modo local: Ejecutando sin conexión a base de datos.');
+}
 
 app.use(cors());
 app.use(express.json());
@@ -34,7 +63,7 @@ const upload = multer({ storage: storage });
 // Mapas en memoria para sesiones dinámicas
 const activeClients = new Map();
 const sessionStates = new Map();
-const disconnectTimers = new Map(); // Temporizadores de gracia para desconexión
+const disconnectTimers = new Map();
 
 // Inicializa una instancia temporal de WhatsApp sin persistencia
 function getOrInitClient(sessionId) {
@@ -47,7 +76,7 @@ function getOrInitClient(sessionId) {
   io.to(sessionId).emit('status', { status: 'authenticating' });
 
   const client = new Client({
-    authStrategy: new NoAuth(), // No guarda archivos ni credenciales en el servidor
+    authStrategy: new NoAuth(),
     puppeteer: {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
@@ -100,7 +129,6 @@ function getOrInitClient(sessionId) {
 
 // Configuración de conexiones de WebSockets
 io.on('connection', (socket) => {
-
   socket.on('join-session', ({ sessionId }) => {
     if (!sessionId) return;
 
@@ -108,7 +136,6 @@ io.on('connection', (socket) => {
     socket.join(sessionId);
     console.log(`Socket unido a sesión temporal: ${sessionId}`);
 
-    // Si había un temporizador de destrucción para esta pestaña, se cancela (el usuario refrescó la página)
     if (disconnectTimers.has(sessionId)) {
       clearTimeout(disconnectTimers.get(sessionId));
       disconnectTimers.delete(sessionId);
@@ -126,7 +153,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Si la pestaña se cierra o el ordenador remoto se apaga
   socket.on('disconnect', () => {
     const sessionId = socket.sessionId;
     if (sessionId) {
@@ -137,7 +163,7 @@ io.on('connection', (socket) => {
         const client = activeClients.get(sessionId);
         if (client) {
           try {
-            await client.destroy(); // Apaga Puppeteer y libera la memoria RAM
+            await client.destroy();
           } catch (e) {
             console.error(`Error al cerrar cliente temporal ${sessionId}:`, e);
           }
@@ -145,14 +171,13 @@ io.on('connection', (socket) => {
         }
         sessionStates.delete(sessionId);
         disconnectTimers.delete(sessionId);
-      }, 15000); // 15 segundos de tolerancia
+      }, 15000);
 
       disconnectTimers.set(sessionId, timer);
     }
   });
 });
 
-// Función auxiliar para formatear los números de teléfono (Perú)
 function formatPhoneNumber(num) {
   let cleaned = num.replace(/\D/g, '');
 
@@ -171,7 +196,6 @@ function formatPhoneNumber(num) {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Endpoint para reiniciar el cliente / desvincular
 app.post('/api/logout', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) {
@@ -192,7 +216,6 @@ app.post('/api/logout', async (req, res) => {
   }
 });
 
-// Endpoint para procesar el envío masivo
 app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
   const { sessionId, numbers: rawNumbers, dnis: rawDnis, message, messages: rawMessages, delaySeconds, scheduledDate } = req.body;
   const file = req.file;
@@ -292,17 +315,20 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
 
     for (let i = 0; i < numbers.length; i++) {
       const rawNum = numbers[i];
+      const currentDni = dnis[i];
       const formattedNum = formatPhoneNumber(rawNum);
-      const timestamp = new Date().toLocaleTimeString();
+      const sendDate = new Date();
+      const timestamp = sendDate.toLocaleTimeString();
 
-      // Seleccionar aleatoriamente un mensaje de las variantes ingresadas
-      const selectedMessage = messagesList[Math.floor(Math.random() * messagesList.length)];
+      const randomMessage = messagesList[Math.floor(Math.random() * messagesList.length)];
+
+      let errorMsg = null;
 
       try {
         if (media) {
-          await client.sendMessage(formattedNum, media, { caption: selectedMessage });
+          await client.sendMessage(formattedNum, media, { caption: randomMessage });
         } else {
-          await client.sendMessage(formattedNum, selectedMessage);
+          await client.sendMessage(formattedNum, randomMessage);
         }
 
         io.to(sessionId).emit('progress', {
@@ -314,16 +340,41 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
           error: null
         });
       } catch (error) {
-        console.error(`[Sesión ${sessionId}] Error:`, error);
+        console.error(`[Sesión ${sessionId}] Error al enviar a ${rawNum}:`, error);
+        errorMsg = error.message || 'Error en el envío';
         io.to(sessionId).emit('progress', {
           current: i + 1,
           total: numbers.length,
           number: rawNum,
           status: 'Fallido',
           time: timestamp,
-          error: error.message || 'Error en el envío'
+          error: errorMsg
         });
       }
+
+      // ==============================================================
+      // INSERCIÓN EN LA BASE DE DATOS SQL SERVER (CONDICIONAL)
+      // ==============================================================
+      if (USE_DB && poolPromise) {
+        try {
+          const pool = await poolPromise;
+          await pool.request()
+            .input('id', sql.NVARCHAR(100), sessionId)
+            .input('fecha', sql.DateTime, sendDate)
+            .input('telefono', sql.NVARCHAR(50), rawNum)
+            .input('dni', sql.NVARCHAR(50), currentDni)
+            .input('mensaje', sql.NVARCHAR(sql.MAX), randomMessage)
+            .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
+            .query(`
+              INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
+              VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
+            `);
+          console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni})`);
+        } catch (dbError) {
+          console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
+        }
+      }
+      // ==============================================================
 
       if (i < numbers.length - 1) {
         await delay(parsedDelay);
@@ -332,7 +383,6 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
   })();
 });
 
-// CONFIGURACIÓN PARA SERVIR EL FRONTEND UNIFICADO
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use(express.static(path.join(__dirname, '../frontend/dist')));
