@@ -21,7 +21,47 @@ const generateTempSessionId = () => {
   return 'iWassi_temp_' + Math.random().toString(36).substring(2, 11);
 };
 
-export default function App() {
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('ErrorBoundary atrapó un error de renderizado:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+          <div className="bg-white p-6 rounded-2xl shadow-md border border-slate-200 max-w-md w-full text-center">
+            <div className="w-12 h-12 rounded-full bg-red-100 text-red-600 flex items-center justify-center mx-auto mb-4">
+              <AlertTriangle className="w-6 h-6" />
+            </div>
+            <h2 className="text-lg font-bold text-slate-800 mb-2">Algo salió mal en la aplicación</h2>
+            <p className="text-xs text-slate-600 mb-4">
+              Ocurrió un error inesperado de renderizado. Puedes intentar recargar la página.
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-4 py-2 rounded-lg transition-colors"
+            >
+              Recargar Aplicación
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function MainApp() {
   // Estado para la sesión temporal (almacenada en sessionStorage para que muera al cerrar la pestaña)
   const [sessionId] = useState(() => {
     let session = sessionStorage.getItem('iwassi_ephemeral_session');
@@ -50,6 +90,7 @@ export default function App() {
 
   // Estado de Envío y Progreso
   const [isSending, setIsSending] = useState(false);
+  const [isSubmittingConfirm, setIsSubmittingConfirm] = useState(false);
   const [isScheduledWaiting, setIsScheduledWaiting] = useState(false);
   const [dispatchMode, setDispatchMode] = useState('immediate');
   const [scheduledDateTime, setScheduledDateTime] = useState('');
@@ -74,29 +115,48 @@ export default function App() {
     });
 
     socketRef.current.on('status', (data) => {
-      setStatus(data.status);
-      if (data.status !== 'qr') {
-        setQrCode(null);
+      if (data && data.status) {
+        setStatus(data.status);
+        if (data.status !== 'qr') {
+          setQrCode(null);
+        }
+        //Si la aplicacion se desconecta la interfaz se desbloquea, NO esta atada a que la barra de status se defina como ready
+        if (data.status === 'ready' || data.status === 'disconnected') {
+          setIsSending(false);
+        }
       }
     });
 
     socketRef.current.on('qr', (data) => {
-      setQrCode(data.qr);
+      setQrCode(data?.qr || null);
     });
 
     socketRef.current.on('progress', (data) => {
       setIsScheduledWaiting(false);
-      setProgress({ current: data.current, total: data.total });
-      setLogs((prev) => [data, ...prev]);
+      if (!data) return;
 
-      if (data.current === data.total) {
+      const current = typeof data.current === 'number' ? data.current : 0;
+      const total = typeof data.total === 'number' ? data.total : 0;
+
+      setProgress({ current, total });
+
+      const safeLog = {
+        status: data?.status ?? 'Desconocido',
+        number: data?.number ?? 'N/A',
+        time: data?.time ?? new Date().toLocaleTimeString(),
+        error: data?.error ?? null
+      };
+
+      setLogs((prev) => [safeLog, ...prev]);
+
+      if (total > 0 && current >= total) {
         setIsSending(false);
       }
     });
 
     socketRef.current.on('waiting_schedule', (data) => {
       setIsScheduledWaiting(true);
-      setLogs((prev) => [{ status: 'info', number: 'Sistema', time: new Date().toLocaleTimeString(), error: data.message }, ...prev]);
+      setLogs((prev) => [{ status: 'info', number: 'Sistema', time: new Date().toLocaleTimeString(), error: data?.message || 'Esperando fecha programada' }, ...prev]);
     });
 
     return () => {
@@ -202,6 +262,8 @@ export default function App() {
   };
 
   const startSending = async () => {
+    if (isSubmittingConfirm || isSending) return;
+    setIsSubmittingConfirm(true);
     setShowConfirm(false);
     setIsSending(true);
     setIsScheduledWaiting(false);
@@ -243,6 +305,8 @@ export default function App() {
     } catch (error) {
       alert('Error de red al intentar enviar');
       setIsSending(false);
+    } finally {
+      setIsSubmittingConfirm(false);
     }
   };
 
@@ -272,6 +336,8 @@ export default function App() {
     const scheduleDate = new Date(scheduledDateTime);
     return scheduleDate.getTime() > Date.now();
   };
+
+  const percent = progress.total > 0 ? Math.min(100, Math.max(0, (progress.current / progress.total) * 100)) : 0;
 
   return (
     <div className="min-h-screen bg-slate-50 pb-12">
@@ -339,6 +405,16 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            {status === 'sending' && (
+              <div className="bg-purple-50 border border-purple-200 text-purple-700 p-4 rounded-xl flex items-start gap-3">
+                <Loader2 className="w-5 h-5 animate-spin flex-shrink-0 mt-0.5 text-purple-600" />
+                <div>
+                  <p className="font-semibold text-sm">Envío en Curso</p>
+                  <p className="text-xs text-purple-600 mt-0.5">Procesando cola de mensajes masivos.</p>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Renderizado de QR o Info Conexión */}
@@ -349,7 +425,7 @@ export default function App() {
                 Abre WhatsApp &gt; Dispositivos vinculados &gt; Vincular un dispositivo
               </p>
             </div>
-          ) : status === 'ready' ? (
+          ) : (status === 'ready' || status === 'sending') ? (
             <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex flex-col items-center">
               <div className="w-16 h-16 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-600 mb-2">
                 <CheckCircle2 className="w-8 h-8" />
@@ -359,7 +435,8 @@ export default function App() {
               </p>
               <button
                 onClick={handleLogout}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2 border border-red-200 text-red-600 hover:bg-red-50 text-xs font-semibold rounded-lg transition-colors"
+                disabled={isSending}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2 border border-red-200 text-red-600 hover:bg-red-50 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
                 Desconectar WhatsApp Ahora
@@ -548,18 +625,18 @@ export default function App() {
                 )}
               </div>
 
-              {/* Mensajes a Enviar (Rotación Aleatoria) */}
+              {/* Mensajes a Enviar (Rotación Secuencial Equitativa) */}
               <div>
                 <div className="flex justify-between items-center mb-1.5">
                   <label className="block text-xs font-bold uppercase tracking-wider text-slate-600">
-                    Mensajes a Enviar (Rotación Aleatoria)
+                    Mensajes a Enviar (Distribución Secuencial Equitativa)
                   </label>
                   <span className="text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-md font-semibold">
                     {validMessages.length} {validMessages.length === 1 ? 'mensaje activo' : 'mensajes activos'}
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-500 mb-2">
-                  Ingresa hasta 3 variantes de mensaje. Cada envío alternará aleatoriamente entre los mensajes completados.
+                  Ingresa hasta 3 variantes de mensaje. Cada envío alternará equitativamente entre los mensajes completados.
                 </p>
                 <div className="space-y-2">
                   <div>
@@ -697,7 +774,7 @@ export default function App() {
               <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
                 <div
                   className="bg-emerald-500 h-full transition-all duration-300"
-                  style={{ width: `${(progress.current / progress.total) * 100}%` }}
+                  style={{ width: `${percent}%` }}
                 />
               </div>
 
@@ -706,18 +783,18 @@ export default function App() {
                 {logs.length === 0 && <span className="text-slate-500">Esperando transmisiones...</span>}
                 {logs.map((log, index) => (
                   <div key={index} className="flex justify-between border-b border-slate-800 pb-1.5 last:border-0">
-                    <div className="flex items-center gap-2">
-                      {log.status === 'Enviado' ? (
+                    <div className="flex items-center gap-2 overflow-hidden">
+                      {log?.status === 'Enviado' ? (
                         <span className="text-green-400 font-bold">[OK]</span>
-                      ) : log.status === 'info' ? (
+                      ) : log?.status === 'info' ? (
                         <span className="text-blue-400 font-bold">[INFO]</span>
                       ) : (
                         <span className="text-red-400 font-bold">[ERROR]</span>
                       )}
-                      <span>{log.number}</span>
-                      {log.error && <span className="text-slate-500 text-[10px]">({log.error})</span>}
+                      <span className="truncate">{log?.number ?? 'N/A'}</span>
+                      {log?.error && <span className="text-slate-500 text-[10px] truncate">({log.error})</span>}
                     </div>
-                    <span className="text-slate-500 text-[10px]">{log.time}</span>
+                    <span className="text-slate-500 text-[10px] flex-shrink-0">{log?.time ?? ''}</span>
                   </div>
                 ))}
               </div>
@@ -740,7 +817,7 @@ export default function App() {
 
             <div className="my-4 p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs space-y-1.5">
               <div className="flex justify-between"><span className="text-slate-400">Total de destinatarios:</span> <span className="font-bold">{parsedNumbersCount}</span></div>
-              <div className="flex justify-between"><span className="text-slate-400">Variantes de mensaje:</span> <span className="font-bold">{validMessages.length} {validMessages.length === 1 ? 'mensaje (fijo)' : 'mensajes (aleatorios)'}</span></div>
+              <div className="flex justify-between"><span className="text-slate-400">Variantes de mensaje:</span> <span className="font-bold">{validMessages.length} {validMessages.length === 1 ? 'mensaje (fijo)' : 'mensajes (secuenciales)'}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Tiempo entre envíos:</span> <span className="font-bold">{delay} segundos</span></div>
               <div className="flex justify-between">
                 <span className="text-slate-400">Modo de inicio:</span>
@@ -753,21 +830,31 @@ export default function App() {
 
             <div className="flex gap-3 mt-6">
               <button
+                disabled={isSubmittingConfirm}
                 onClick={() => setShowConfirm(false)}
-                className="flex-1 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition-colors"
+                className="flex-1 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-lg transition-colors disabled:opacity-50"
               >
                 Cancelar
               </button>
               <button
+                disabled={isSubmittingConfirm || isSending}
                 onClick={startSending}
-                className="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg transition-colors"
+                className="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                Sí, iniciar envío
+                {isSubmittingConfirm ? 'Iniciando...' : 'Sí, iniciar envío'}
               </button>
             </div>
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <MainApp />
+    </ErrorBoundary>
   );
 }

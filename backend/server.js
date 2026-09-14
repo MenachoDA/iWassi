@@ -179,7 +179,12 @@ io.on('connection', (socket) => {
 });
 
 function formatPhoneNumber(num) {
+  if (!num || typeof num !== 'string') return null;
   let cleaned = num.replace(/\D/g, '');
+
+  if (cleaned.length < 8) {
+    return null;
+  }
 
   if (cleaned.length === 9) {
     cleaned = `51${cleaned}`;
@@ -226,6 +231,10 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
 
   const client = activeClients.get(sessionId);
   const state = sessionStates.get(sessionId);
+
+  if (state && state.status === 'sending') {
+    return res.status(429).json({ success: false, error: 'Ya hay un proceso de envío en curso para esta sesión' });
+  }
 
   if (!client || !state || state.status !== 'ready') {
     return res.status(400).json({ success: false, error: 'El servicio de WhatsApp temporal no está listo' });
@@ -292,92 +301,195 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     }
   }
 
+  // Establecer estado de la sesión en 'sending' para bloquear peticiones concurrentes
+  sessionStates.set(sessionId, { ...state, status: 'sending' });
+
   res.json({ success: true, message: 'Proceso de envío masivo iniciado', total: numbers.length });
 
   (async () => {
-    if (waitMs > 0) {
-      io.to(sessionId).emit('waiting_schedule', {
-        scheduledDate,
-        message: 'Esperando a la hora programada...'
-      });
-      console.log(`[Sesión ${sessionId}] Esperando ${Math.round(waitMs / 1000)}s para envío programado.`);
-      await delay(waitMs);
-    }
+    try {
+      if (waitMs > 0) {
+        io.to(sessionId).emit('waiting_schedule', {
+          scheduledDate,
+          message: 'Esperando a la hora programada...'
+        });
+        console.log(`[Sesión ${sessionId}] Esperando ${Math.round(waitMs / 1000)}s para envío programado.`);
+        await delay(waitMs);
+      }
 
-    let media = null;
-    if (file) {
-      media = new MessageMedia(
-        file.mimetype,
-        file.buffer.toString('base64'),
-        file.originalname
-      );
-    }
+      let media = null;
+      if (file) {
+        media = new MessageMedia(
+          file.mimetype,
+          file.buffer.toString('base64'),
+          file.originalname
+        );
+      }
 
-    for (let i = 0; i < numbers.length; i++) {
-      const rawNum = numbers[i];
-      const currentDni = dnis[i];
-      const formattedNum = formatPhoneNumber(rawNum);
-      const sendDate = new Date();
-      const timestamp = sendDate.toLocaleTimeString();
+      for (let i = 0; i < numbers.length; i++) {
+        if (!activeClients.has(sessionId)) {
+          console.log('Sesión destruida, abortando envío.');
+          break;
+        }
 
-      const randomMessage = messagesList[Math.floor(Math.random() * messagesList.length)];
+        const rawNum = numbers[i];
+        const currentDni = dnis[i];
+        const formattedNum = formatPhoneNumber(rawNum);
+        const sendDate = new Date();
+        const timestamp = sendDate.toLocaleTimeString();
 
-      let errorMsg = null;
+        // Selección secuencial y equitativa de mensajes
+        const selectedMessage = messagesList[i % messagesList.length];
 
-      try {
-        if (media) {
-          await client.sendMessage(formattedNum, media, { caption: randomMessage });
+        let errorMsg = null;
+
+        if (!formattedNum) {
+          errorMsg = 'Número inválido';
+          io.to(sessionId).emit('progress', {
+            current: i + 1,
+            total: numbers.length,
+            number: rawNum,
+            status: 'Fallido',
+            time: timestamp,
+            error: errorMsg
+          });
+
+          if (USE_DB && poolPromise) {
+            try {
+              const pool = await poolPromise;
+              await pool.request()
+                .input('id', sql.NVARCHAR(100), sessionId)
+                .input('fecha', sql.DateTime, sendDate)
+                .input('telefono', sql.NVARCHAR(50), rawNum)
+                .input('dni', sql.NVARCHAR(50), currentDni)
+                .input('mensaje', sql.NVARCHAR(sql.MAX), selectedMessage)
+                .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
+                .query(`
+                  INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
+                  VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
+                `);
+              console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni}) - Número inválido`);
+            } catch (dbError) {
+              console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
+            }
+          }
+
+          if (i < numbers.length - 1) {
+            await delay(parsedDelay);
+          }
+          continue;
+        }
+
+        // Intento de envío con reintentos para errores específicos de Puppeteer
+        const retryableErrors = [
+          'Execution context was destroyed',
+          'navigating',
+          'Target closed',
+          'getChat'
+        ];
+
+        let sendSuccess = false;
+        let attempts = 0;
+        const maxRetries = 2;
+        let lastError = null;
+
+        while (attempts <= maxRetries && !sendSuccess) {
+          if (!activeClients.has(sessionId)) {
+            console.log('Sesión destruida durante reintento, abortando envío.');
+            break;
+          }
+
+          try {
+            if (media) {
+              await client.sendMessage(formattedNum, media, { caption: selectedMessage });
+            } else {
+              await client.sendMessage(formattedNum, selectedMessage);
+            }
+            sendSuccess = true;
+          } catch (error) {
+            lastError = error;
+            const errorStr = error?.message || String(error);
+            const isRetryable = retryableErrors.some(errText => errorStr.includes(errText));
+
+            if (isRetryable && attempts < maxRetries) {
+              attempts++;
+              console.warn(`[Sesión ${sessionId}] Error reintentable (${attempts}/${maxRetries}) para ${rawNum}: ${errorStr}. Reintentando en 3s...`);
+              await delay(3000);
+            } else {
+              break;
+            }
+          }
+        }
+
+        if (sendSuccess) {
+          io.to(sessionId).emit('progress', {
+            current: i + 1,
+            total: numbers.length,
+            number: rawNum,
+            status: 'Enviado',
+            time: timestamp,
+            error: null
+          });
         } else {
-          await client.sendMessage(formattedNum, randomMessage);
+          errorMsg = lastError?.message || 'Error en el envío';
+          console.error(`[Sesión ${sessionId}] Error al enviar a ${rawNum}:`, errorMsg);
+          io.to(sessionId).emit('progress', {
+            current: i + 1,
+            total: numbers.length,
+            number: rawNum,
+            status: 'Fallido',
+            time: timestamp,
+            error: errorMsg
+          });
         }
 
-        io.to(sessionId).emit('progress', {
-          current: i + 1,
-          total: numbers.length,
-          number: rawNum,
-          status: 'Enviado',
-          time: timestamp,
-          error: null
-        });
-      } catch (error) {
-        console.error(`[Sesión ${sessionId}] Error al enviar a ${rawNum}:`, error);
-        errorMsg = error.message || 'Error en el envío';
-        io.to(sessionId).emit('progress', {
-          current: i + 1,
-          total: numbers.length,
-          number: rawNum,
-          status: 'Fallido',
-          time: timestamp,
-          error: errorMsg
-        });
-      }
+        // ==============================================================
+        // INSERCIÓN EN LA BASE DE DATOS SQL SERVER (CONDICIONAL)
+        // ==============================================================
+        if (USE_DB && poolPromise) {
+          try {
+            const pool = await poolPromise;
+            await pool.request()
+              .input('id', sql.NVARCHAR(100), sessionId)
+              .input('fecha', sql.DateTime, sendDate)
+              .input('telefono', sql.NVARCHAR(50), rawNum)
+              .input('dni', sql.NVARCHAR(50), currentDni)
+              .input('mensaje', sql.NVARCHAR(sql.MAX), selectedMessage)
+              .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
+              .query(`
+                INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
+                VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
+              `);
+            console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni})`);
+          } catch (dbError) {
+            console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
+          }
+        }
+        // ==============================================================
 
-      // ==============================================================
-      // INSERCIÓN EN LA BASE DE DATOS SQL SERVER (CONDICIONAL)
-      // ==============================================================
-      if (USE_DB && poolPromise) {
-        try {
-          const pool = await poolPromise;
-          await pool.request()
-            .input('id', sql.NVARCHAR(100), sessionId)
-            .input('fecha', sql.DateTime, sendDate)
-            .input('telefono', sql.NVARCHAR(50), rawNum)
-            .input('dni', sql.NVARCHAR(50), currentDni)
-            .input('mensaje', sql.NVARCHAR(sql.MAX), randomMessage)
-            .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
-            .query(`
-              INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
-              VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
-            `);
-          console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni})`);
-        } catch (dbError) {
-          console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
+        // Si el envío falló (por error persistente de Puppeteer o detached Frame), abortar el envío para no saturar
+        if (!sendSuccess) {
+          if (errorMsg && errorMsg.includes('detached Frame')) {
+            console.error(`[Sesión ${sessionId}] Error fatal de Frame. Abortando todo el envío.`);
+            break; // Solo abortar si Chromium colapsó
+          } else {
+            console.warn(`[Sesión ${sessionId}] Saltando al siguiente número por error aislado: ${errorMsg}`);
+            continue; // Pasar al siguiente contacto sin detener el envio completo
+          }
+        }
+
+        if (i < numbers.length - 1) {
+          await delay(parsedDelay);
         }
       }
-      // ==============================================================
-
-      if (i < numbers.length - 1) {
-        await delay(parsedDelay);
+    } catch (criticalErr) {
+      console.error(`[Sesión ${sessionId}] Error crítico no controlado en envío masivo:`, criticalErr);
+    } finally {
+      const currentClient = activeClients.get(sessionId);
+      const currentState = sessionStates.get(sessionId);
+      if (currentClient && currentState && currentState.status === 'sending') {
+        sessionStates.set(sessionId, { ...currentState, status: 'ready' });
+        io.to(sessionId).emit('status', { status: 'ready' });
       }
     }
   })();
