@@ -1,7 +1,7 @@
 {
   "name": "iWassi",
-  "version": "4.3.0",
-  "description": "Backend para envío masivo de WhatsApp usando whatsapp-web.js",
+  "version": "4.3.5",
+  "description": "Backend de iWassi, aplicacion web para envios masivos con whatsapp-web.js",
   "main": "server.js",
   "type": "module",
   "scripts": {
