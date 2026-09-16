@@ -13,6 +13,15 @@ import sql from 'mssql';
 // Cargar variables de entorno
 dotenv.config();
 
+// Handlers globales para blindar el proceso de Node.js contra caídas no controladas (Requerimiento 5)
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection interceptado de forma segura:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception interceptado de forma segura:', err);
+});
+
 // Extraemos NoAuth para sesiones efímeras sin almacenamiento en disco
 const { Client, NoAuth, MessageMedia } = pkg;
 
@@ -65,6 +74,29 @@ const activeClients = new Map();
 const sessionStates = new Map();
 const disconnectTimers = new Map();
 
+// Función auxiliar para registrar resultados en BD de forma aislada
+async function logToDatabase({ sessionId, sendDate, rawNum, currentDni, selectedMessage, errorMsg }) {
+  if (USE_DB && poolPromise) {
+    try {
+      const pool = await poolPromise;
+      await pool.request()
+        .input('id', sql.NVARCHAR(100), sessionId)
+        .input('fecha', sql.DateTime, sendDate)
+        .input('telefono', sql.NVARCHAR(50), rawNum)
+        .input('dni', sql.NVARCHAR(50), currentDni)
+        .input('mensaje', sql.NVARCHAR(sql.MAX), selectedMessage)
+        .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
+        .query(`
+          INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
+          VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
+        `);
+      console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni})${errorMsg ? ` - Error: ${errorMsg}` : ''}`);
+    } catch (dbError) {
+      console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
+    }
+  }
+}
+
 // Inicializa una instancia temporal de WhatsApp sin persistencia
 function getOrInitClient(sessionId) {
   if (activeClients.has(sessionId)) {
@@ -72,7 +104,7 @@ function getOrInitClient(sessionId) {
   }
 
   console.log(`Iniciando cliente temporal de WhatsApp para sesión: ${sessionId}`);
-  sessionStates.set(sessionId, { status: 'authenticating', lastQr: null });
+  sessionStates.set(sessionId, { status: 'authenticating', lastQr: null, abortRequested: false });
   io.to(sessionId).emit('status', { status: 'authenticating' });
 
   const client = new Client({
@@ -84,10 +116,12 @@ function getOrInitClient(sessionId) {
   });
 
   client.on('qr', (qr) => {
-    sessionStates.set(sessionId, { status: 'qr', lastQr: null });
+    const currentState = sessionStates.get(sessionId) || {};
+    sessionStates.set(sessionId, { ...currentState, status: 'qr', lastQr: null });
     qrcode.toDataURL(qr, (err, url) => {
       if (!err) {
-        sessionStates.set(sessionId, { status: 'qr', lastQr: url });
+        const state = sessionStates.get(sessionId) || {};
+        sessionStates.set(sessionId, { ...state, status: 'qr', lastQr: url });
         io.to(sessionId).emit('qr', { qr: url });
         io.to(sessionId).emit('status', { status: 'qr' });
       }
@@ -95,20 +129,23 @@ function getOrInitClient(sessionId) {
   });
 
   client.on('ready', () => {
-    sessionStates.set(sessionId, { status: 'ready', lastQr: null });
+    const currentState = sessionStates.get(sessionId) || {};
+    sessionStates.set(sessionId, { ...currentState, status: 'ready', lastQr: null });
     console.log(`Cliente listo en sesión temporal: ${sessionId}`);
     io.to(sessionId).emit('status', { status: 'ready' });
   });
 
   client.on('auth_failure', (msg) => {
     console.error(`Fallo de autenticación en sesión temporal ${sessionId}:`, msg);
-    sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
+    const currentState = sessionStates.get(sessionId) || {};
+    sessionStates.set(sessionId, { ...currentState, status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected', message: msg });
   });
 
   client.on('disconnected', (reason) => {
     console.log(`Cliente desvinculado en sesión temporal ${sessionId}:`, reason);
-    sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
+    const currentState = sessionStates.get(sessionId) || {};
+    sessionStates.set(sessionId, { ...currentState, status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected', reason });
 
     try {
@@ -119,7 +156,8 @@ function getOrInitClient(sessionId) {
 
   client.initialize().catch(err => {
     console.error(`Error al inicializar sesión temporal ${sessionId}:`, err);
-    sessionStates.set(sessionId, { status: 'disconnected', lastQr: null });
+    const currentState = sessionStates.get(sessionId) || {};
+    sessionStates.set(sessionId, { ...currentState, status: 'disconnected', lastQr: null });
     io.to(sessionId).emit('status', { status: 'disconnected' });
   });
 
@@ -129,37 +167,54 @@ function getOrInitClient(sessionId) {
 
 // Configuración de conexiones de WebSockets
 io.on('connection', (socket) => {
-  socket.on('join-session', ({ sessionId }) => {
+  const handleJoinSession = ({ sessionId }) => {
     if (!sessionId) return;
 
     socket.sessionId = sessionId;
     socket.join(sessionId);
     console.log(`Socket unido a sesión temporal: ${sessionId}`);
 
+    // Si había un temporizador de desconexión corriendo, se cancela al reconectarse (Requerimiento 2)
     if (disconnectTimers.has(sessionId)) {
       clearTimeout(disconnectTimers.get(sessionId));
       disconnectTimers.delete(sessionId);
       console.log(`Reconexión rápida detectada. Cancelado temporizador de cierre para: ${sessionId}`);
     }
 
-    getOrInitClient(sessionId);
-
     const state = sessionStates.get(sessionId);
     if (state) {
-      socket.emit('status', { status: state.status });
-      if (state.lastQr) {
-        socket.emit('qr', { qr: state.lastQr });
+      state.abortRequested = false;
+    }
+
+    getOrInitClient(sessionId);
+
+    const currentState = sessionStates.get(sessionId);
+    if (currentState) {
+      socket.emit('status', { status: currentState.status });
+      if (currentState.lastQr) {
+        socket.emit('qr', { qr: currentState.lastQr });
       }
     }
-  });
+  };
+
+  socket.on('join-session', handleJoinSession);
+  socket.on('join_session', handleJoinSession);
 
   socket.on('disconnect', () => {
     const sessionId = socket.sessionId;
     if (sessionId) {
-      console.log(`Pestaña desconectada para sesión ${sessionId}. Esperando 15 segundos antes de destruir...`);
+      console.log(`Pestaña desconectada para sesión ${sessionId}. Esperando 2 minutos antes de destruir...`);
 
+      // Tiempo de gracia ampliado a 2 minutos (120,000 ms) (Requerimiento 2)
       const timer = setTimeout(async () => {
-        console.log(`Tiempo de gracia cumplido. Destruyendo sesión de WhatsApp de forma segura: ${sessionId}`);
+        console.log(`[Sesión ${sessionId}] Tiempo de gracia de 2 min cumplido sin reconexión.`);
+        
+        // Activar bandera de cancelación por sesión (Requerimiento 3)
+        const state = sessionStates.get(sessionId);
+        if (state) {
+          state.abortRequested = true;
+        }
+
         const client = activeClients.get(sessionId);
         if (client) {
           try {
@@ -171,7 +226,7 @@ io.on('connection', (socket) => {
         }
         sessionStates.delete(sessionId);
         disconnectTimers.delete(sessionId);
-      }, 15000);
+      }, 120000);
 
       disconnectTimers.set(sessionId, timer);
     }
@@ -200,6 +255,23 @@ function formatPhoneNumber(num) {
 }
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Espera interrumpible que evalúa periódicamente la bandera abortRequested (Requerimiento 3)
+async function waitWithAbortCheck(ms, sessionId) {
+  const checkInterval = 250;
+  let elapsed = 0;
+  while (elapsed < ms) {
+    const st = sessionStates.get(sessionId);
+    if (st?.abortRequested || !activeClients.has(sessionId)) {
+      return true;
+    }
+    const chunk = Math.min(checkInterval, ms - elapsed);
+    await delay(chunk);
+    elapsed += chunk;
+  }
+  const st = sessionStates.get(sessionId);
+  return !!(st?.abortRequested || !activeClients.has(sessionId));
+}
 
 app.post('/api/logout', async (req, res) => {
   const { sessionId } = req.body;
@@ -301,8 +373,8 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
     }
   }
 
-  // Establecer estado de la sesión en 'sending' para bloquear peticiones concurrentes
-  sessionStates.set(sessionId, { ...state, status: 'sending' });
+  // Establecer estado de la sesión en 'sending' y resetear abortRequested
+  sessionStates.set(sessionId, { ...state, status: 'sending', abortRequested: false });
 
   res.json({ success: true, message: 'Proceso de envío masivo iniciado', total: numbers.length });
 
@@ -314,7 +386,12 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
           message: 'Esperando a la hora programada...'
         });
         console.log(`[Sesión ${sessionId}] Esperando ${Math.round(waitMs / 1000)}s para envío programado.`);
-        await delay(waitMs);
+        
+        const isAbortedSchedule = await waitWithAbortCheck(waitMs, sessionId);
+        if (isAbortedSchedule) {
+          console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
+          return;
+        }
       }
 
       let media = null;
@@ -327,8 +404,10 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
       }
 
       for (let i = 0; i < numbers.length; i++) {
-        if (!activeClients.has(sessionId)) {
-          console.log('Sesión destruida, abortando envío.');
+        // Evaluación de bandera de cancelación por sesión antes de procesar cada contacto (Requerimiento 3)
+        const currentSessionState = sessionStates.get(sessionId);
+        if (currentSessionState?.abortRequested || !activeClients.has(sessionId)) {
+          console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
           break;
         }
 
@@ -343,6 +422,7 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
 
         let errorMsg = null;
 
+        // 1. Validación de formato de teléfono
         if (!formattedNum) {
           errorMsg = 'Número inválido';
           io.to(sessionId).emit('progress', {
@@ -354,33 +434,88 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
             error: errorMsg
           });
 
-          if (USE_DB && poolPromise) {
-            try {
-              const pool = await poolPromise;
-              await pool.request()
-                .input('id', sql.NVARCHAR(100), sessionId)
-                .input('fecha', sql.DateTime, sendDate)
-                .input('telefono', sql.NVARCHAR(50), rawNum)
-                .input('dni', sql.NVARCHAR(50), currentDni)
-                .input('mensaje', sql.NVARCHAR(sql.MAX), selectedMessage)
-                .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
-                .query(`
-                  INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
-                  VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
-                `);
-              console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni}) - Número inválido`);
-            } catch (dbError) {
-              console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
-            }
-          }
+          await logToDatabase({
+            sessionId,
+            sendDate,
+            rawNum,
+            currentDni,
+            selectedMessage,
+            errorMsg
+          });
 
           if (i < numbers.length - 1) {
-            await delay(parsedDelay);
+            const isAborted = await waitWithAbortCheck(parsedDelay, sessionId);
+            if (isAborted) {
+              console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
+              break;
+            }
           }
           continue;
         }
 
-        // Intento de envío con reintentos para errores específicos de Puppeteer
+        // 2. Validación nativa del destinatario con getNumberId (Requerimiento 1)
+        let contactId = null;
+        try {
+          contactId = await client.getNumberId(formattedNum);
+        } catch (getIdError) {
+          const getIdErrStr = getIdError?.message || String(getIdError);
+          console.warn(`[Sesión ${sessionId}] Error al consultar getNumberId para ${formattedNum}:`, getIdErrStr);
+          
+          if (getIdErrStr.includes('detached Frame')) {
+            errorMsg = `Error fatal detached Frame: ${getIdErrStr}`;
+            io.to(sessionId).emit('progress', {
+              current: i + 1,
+              total: numbers.length,
+              number: rawNum,
+              status: 'Fallido',
+              time: timestamp,
+              error: errorMsg
+            });
+            await logToDatabase({ sessionId, sendDate, rawNum, currentDni, selectedMessage, errorMsg });
+            
+            console.error(`[Sesión ${sessionId}] Error fatal de Frame en getNumberId. Abortando todo el envío.`);
+            await client.destroy().catch(err => console.warn('Aviso al destruir cliente con frame roto:', err.message));
+            activeClients.delete(sessionId);
+            sessionStates.delete(sessionId);
+            break;
+          }
+        }
+
+        if (!contactId) {
+          errorMsg = 'Número no registrado en WhatsApp';
+          console.warn(`[Sesión ${sessionId}] Número no registrado en WhatsApp: ${rawNum} (${formattedNum})`);
+
+          io.to(sessionId).emit('progress', {
+            current: i + 1,
+            total: numbers.length,
+            number: rawNum,
+            status: 'Fallido',
+            time: timestamp,
+            error: errorMsg
+          });
+
+          await logToDatabase({
+            sessionId,
+            sendDate,
+            rawNum,
+            currentDni,
+            selectedMessage,
+            errorMsg
+          });
+
+          if (i < numbers.length - 1) {
+            const isAborted = await waitWithAbortCheck(parsedDelay, sessionId);
+            if (isAborted) {
+              console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
+              break;
+            }
+          }
+          continue;
+        }
+
+        const targetNum = contactId._serialized || formattedNum;
+
+        // 3. Intento de envío con reintentos para errores específicos y captura de errores fatales/LID (Requerimientos 1 y 4)
         const retryableErrors = [
           'Execution context was destroyed',
           'navigating',
@@ -392,23 +527,37 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
         let attempts = 0;
         const maxRetries = 2;
         let lastError = null;
+        let isFatalFrame = false;
+        let isNoLidError = false;
 
         while (attempts <= maxRetries && !sendSuccess) {
-          if (!activeClients.has(sessionId)) {
-            console.log('Sesión destruida durante reintento, abortando envío.');
+          const stState = sessionStates.get(sessionId);
+          if (stState?.abortRequested || !activeClients.has(sessionId)) {
+            console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
             break;
           }
 
           try {
             if (media) {
-              await client.sendMessage(formattedNum, media, { caption: selectedMessage });
+              await client.sendMessage(targetNum, media, { caption: selectedMessage });
             } else {
-              await client.sendMessage(formattedNum, selectedMessage);
+              await client.sendMessage(targetNum, selectedMessage);
             }
             sendSuccess = true;
           } catch (error) {
             lastError = error;
             const errorStr = error?.message || String(error);
+
+            if (errorStr.includes('detached Frame')) {
+              isFatalFrame = true;
+              break;
+            }
+
+            if (errorStr.includes('No LID for user')) {
+              isNoLidError = true;
+              break;
+            }
+
             const isRetryable = retryableErrors.some(errText => errorStr.includes(errText));
 
             if (isRetryable && attempts < maxRetries) {
@@ -421,6 +570,15 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
           }
         }
 
+        // Evaluar aborto tras intentar el envío
+        const postState = sessionStates.get(sessionId);
+        if (postState?.abortRequested || !activeClients.has(sessionId)) {
+          if (!sendSuccess && !isFatalFrame) {
+            console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
+            break;
+          }
+        }
+
         if (sendSuccess) {
           io.to(sessionId).emit('progress', {
             current: i + 1,
@@ -430,9 +588,20 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
             time: timestamp,
             error: null
           });
-        } else {
-          errorMsg = lastError?.message || 'Error en el envío';
-          console.error(`[Sesión ${sessionId}] Error al enviar a ${rawNum}:`, errorMsg);
+
+          await logToDatabase({
+            sessionId,
+            sendDate,
+            rawNum,
+            currentDni,
+            selectedMessage,
+            errorMsg: null
+          });
+        } else if (isFatalFrame) {
+          // Manejo del error fatal "detached Frame" y limpieza segura (Requerimiento 4)
+          errorMsg = lastError?.message || 'detached Frame';
+          console.error(`[Sesión ${sessionId}] Error fatal detached Frame para ${rawNum}:`, errorMsg);
+
           io.to(sessionId).emit('progress', {
             current: i + 1,
             total: numbers.length,
@@ -441,53 +610,92 @@ app.post('/api/send-bulk', upload.single('attachment'), async (req, res) => {
             time: timestamp,
             error: errorMsg
           });
-        }
 
-        // ==============================================================
-        // INSERCIÓN EN LA BASE DE DATOS SQL SERVER (CONDICIONAL)
-        // ==============================================================
-        if (USE_DB && poolPromise) {
-          try {
-            const pool = await poolPromise;
-            await pool.request()
-              .input('id', sql.NVARCHAR(100), sessionId)
-              .input('fecha', sql.DateTime, sendDate)
-              .input('telefono', sql.NVARCHAR(50), rawNum)
-              .input('dni', sql.NVARCHAR(50), currentDni)
-              .input('mensaje', sql.NVARCHAR(sql.MAX), selectedMessage)
-              .input('error', sql.NVARCHAR(sql.MAX), errorMsg)
-              .query(`
-                INSERT INTO iwassi (id, fecha, telefono, dni, mensaje, error)
-                VALUES (@id, @fecha, @telefono, @dni, @mensaje, @error)
-              `);
-            console.log(`Registro guardado en BD para ${rawNum} (DNI: ${currentDni})`);
-          } catch (dbError) {
-            console.error(`Error guardando en la BD para el número ${rawNum}:`, dbError);
+          await logToDatabase({
+            sessionId,
+            sendDate,
+            rawNum,
+            currentDni,
+            selectedMessage,
+            errorMsg
+          });
+
+          console.error(`[Sesión ${sessionId}] Pestaña de Chromium colapsó de manera irreversible. Destruyendo sesión y abortando envío.`);
+          await client.destroy().catch(err => console.warn('Aviso al destruir cliente con frame roto:', err.message));
+          activeClients.delete(sessionId);
+          sessionStates.delete(sessionId);
+          break; // Salir inmediatamente del bucle
+        } else if (isNoLidError) {
+          // Manejo del error "No LID for user" en catch (Requerimiento 1)
+          errorMsg = 'Número no registrado en WhatsApp';
+          console.warn(`[Sesión ${sessionId}] Error No LID for user para ${rawNum}: registrado como número no registrado.`);
+
+          io.to(sessionId).emit('progress', {
+            current: i + 1,
+            total: numbers.length,
+            number: rawNum,
+            status: 'Fallido',
+            time: timestamp,
+            error: errorMsg
+          });
+
+          await logToDatabase({
+            sessionId,
+            sendDate,
+            rawNum,
+            currentDni,
+            selectedMessage,
+            errorMsg
+          });
+
+          if (i < numbers.length - 1) {
+            const isAborted = await waitWithAbortCheck(parsedDelay, sessionId);
+            if (isAborted) {
+              console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
+              break;
+            }
           }
-        }
-        // ==============================================================
+          continue; // Salto al siguiente número sin detener el bucle
+        } else {
+          // Otros errores aislados
+          errorMsg = lastError?.message || 'Error en el envío';
+          console.error(`[Sesión ${sessionId}] Error al enviar a ${rawNum}:`, errorMsg);
 
-        // Si el envío falló (por error persistente de Puppeteer o detached Frame), abortar el envío para no saturar
-        if (!sendSuccess) {
-          if (errorMsg && errorMsg.includes('detached Frame')) {
-            console.error(`[Sesión ${sessionId}] Error fatal de Frame. Abortando todo el envío.`);
-            break; // Solo abortar si Chromium colapsó
-          } else {
-            console.warn(`[Sesión ${sessionId}] Saltando al siguiente número por error aislado: ${errorMsg}`);
-            continue; // Pasar al siguiente contacto sin detener el envio completo
-          }
+          io.to(sessionId).emit('progress', {
+            current: i + 1,
+            total: numbers.length,
+            number: rawNum,
+            status: 'Fallido',
+            time: timestamp,
+            error: errorMsg
+          });
+
+          await logToDatabase({
+            sessionId,
+            sendDate,
+            rawNum,
+            currentDni,
+            selectedMessage,
+            errorMsg
+          });
         }
 
+        // 4. Intervalo de espera con evaluación de cancelación pacífica (Requerimientos 2 y 3)
         if (i < numbers.length - 1) {
-          await delay(parsedDelay);
+          const isAborted = await waitWithAbortCheck(parsedDelay, sessionId);
+          if (isAborted) {
+            console.log(`[Sesión ${sessionId}] Envío detenido pacíficamente por superar los 2 min de desconexión.`);
+            break;
+          }
         }
       }
     } catch (criticalErr) {
       console.error(`[Sesión ${sessionId}] Error crítico no controlado en envío masivo:`, criticalErr);
     } finally {
+      // Al finalizar el bucle, si la sesión sigue en activeClients, restablecer el estado a ready (Requerimiento 5)
       const currentClient = activeClients.get(sessionId);
       const currentState = sessionStates.get(sessionId);
-      if (currentClient && currentState && currentState.status === 'sending') {
+      if (currentClient && currentState) {
         sessionStates.set(sessionId, { ...currentState, status: 'ready' });
         io.to(sessionId).emit('status', { status: 'ready' });
       }
